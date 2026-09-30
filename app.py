@@ -13,68 +13,137 @@ st.write("DVDから抽出したZipファイルをアップロードすると、1
 # 簡易パスワード認証
 password = st.text_input("職員用パスワードを入力してください", type="password")
 
-if password == "reiki2026": # ← 必要に応じて変更してください
+if password == "reiki063215": # ← 必要に応じて変更してください
     st.success("認証されました。")
     st.markdown("---")
     
-    # Zipファイルアップローダー
-    uploaded_file = st.file_uploader("DVD内のHTMLデータ（Zip圧縮したもの）を選択してください", type=["zip"])
-    
-    if uploaded_file is not None:
-        if st.button("🚀 テキスト変換を開始する", type="primary"):
-            with st.spinner("HTMLファイルを解析中...（数秒〜十数秒かかります）"):
-                try:
-                    # メモリ上でZipを展開
-                    input_zip = zipfile.ZipFile(io.BytesIO(uploaded_file.read()))
-                    
-                    # 編ごとの抽出結果を保持する辞書
-                    hen_texts = {}
-                    
-                    # Zip内の各HTMLファイルを処理
-                    for file_info in input_zip.infolist():
-                        if file_info.filename.endswith(('.html', '.htm')):
-                            filename = os.path.basename(file_info.filename)
-                            
-                            # ファイル名から編番号を取得（例: reiki_honbun_g00100.html 等の規則に対応）
-                            # ※必要に応じて分類ルールを調整可能
-                            hen_name = "第01編_総務" 
-                            
-                            # HTML読み込みと文字コード自動判定
-                            html_content = input_zip.read(file_info)
-                            try:
-                                html_text = html_content.decode('cp932') # Shift_JIS系
-                            except:
-                                html_text = html_content.decode('utf-8', errors='ignore')
-                                
-                            soup = BeautifulSoup(html_text, 'html.parser')
-                            
-                            # 不要タグの除去
-                            for script in soup(["script", "style"]):
-                                script.decompose()
-                                
-                            # プレーンテキスト（またはマークダウン）化
-                            text_content = soup.get_text(separator="\n")
-                            
-                            if hen_name not in hen_texts:
-                                hen_texts[hen_name] = ""
-                            hen_texts[hen_name] += f"\n\n【例規ファイル】: {filename}\n" + text_content
+# 1. ZIPファイルのアップロード
+uploaded_zip = st.file_uploader("例規データのZIPファイルをアップロードしてください", type=["zip"])
 
-                    # 出力用Zipファイルをメモリ上で作成
-                    output_buffer = io.BytesIO()
-                    with zipfile.ZipFile(output_buffer, "w", zipfile.ZIP_DEFLATED) as out_zip:
-                        for hen_title, content in hen_texts.items():
-                            out_zip.writestr(f"{hen_title}.txt", content)
+if uploaded_zip is not None:
+    zip_buffer = io.BytesIO(uploaded_zip.read())
+    
+    with zipfile.ZipFile(zip_buffer, "r") as z:
+        all_files = z.namelist()
+        
+        # --- 【ファイル特定の厳格化】 ---
+        # bunya0010000.html や bunya_0010000.html などの特定ファイル名のみを検索
+        target_bunya_file = None
+        for f in all_files:
+            filename = f.split("/")[-1].lower() # フォルダ階層を無視してファイル名のみで判定
+            if filename in ["bunya_0010000.html", "bunya0010000.html"]:
+                target_bunya_file = f
+                break
+
+        # 本文ファイル（_J.html）のリストアップ
+        j_files = [f for f in all_files if f.endswith("_J.html") or f.endswith("_j.html")]
+
+        # 情報表示
+        st.subheader("📊 ZIP内の解析対象判定")
+        col1, col2 = st.columns(2)
+        
+        if target_bunya_file:
+            col1.success(f"目次ファイル検出: `{target_bunya_file}`")
+        else:
+            col1.error("❌ `bunya_0010000.html` が見つかりませんでした")
+
+        col2.info(f"本文HTML (_J) 総数: {len(j_files)} 件")
+
+        # 目次ファイルが見つかった場合のみ処理を実行
+        if target_bunya_file and j_files:
+            if st.button("絞り込みデータ化を実行する"):
+                
+                # --- A. 目次ファイル (bunya_0010000.html) の解析 ---
+                bunya_bytes = z.read(target_bunya_file)
+                try:
+                    bunya_html = bunya_bytes.decode("cp932")
+                except UnicodeDecodeError:
+                    bunya_html = bunya_bytes.decode("utf-8", errors="ignore")
+
+                bunya_soup = BeautifulSoup(bunya_html, "html.parser")
+                re_link = re.compile(r"OpenResDataWin\('([^']+)'\)")
+                
+                categories = []
+                # 目次内のリンク要素を抽出
+                for elem in bunya_soup.find_all(['td', 'div', 'p', 'a']):
+                    onclick_attr = elem.get('onclick', '') or elem.get('href', '')
+                    match = re_link.search(onclick_attr)
+                    if match:
+                        doc_id = match.group(1)
+                        title = elem.get_text(strip=True)
+                        if title and doc_id:
+                            categories.append({"id": doc_id, "title": title})
+
+                # 重複IDの除去
+                seen = set()
+                unique_categories = []
+                for item in categories:
+                    if item['id'] not in seen:
+                        seen.add(item['id'])
+                        unique_categories.append(item)
+
+                st.write(f"✅ `bunya_0010000.html` から **{len(unique_categories)} 件** の例規IDを取得しました。")
+
+                # --- B. 該当する _J.html のみを抽出・パース ---
+                # 高速参照用に _J ファイルのマップを作成
+                j_file_map = {}
+                for path in j_files:
+                    filename = path.split("/")[-1]
+                    doc_id = filename.replace("_J.html", "").replace("_j.html", "")
+                    j_file_map[doc_id] = path
+
+                processed_data = []
+                missing_ids = []
+
+                progress_bar = st.progress(0)
+
+                for idx, item in enumerate(unique_categories):
+                    doc_id = item['id']
                     
-                    output_buffer.seek(0)
-                    
-                    st.success("✅ 13編のテキストデータの変換処理が正常に完了しました！")
-                    
-                    # ダウンロードボタン表示
+                    if doc_id in j_file_map:
+                        # 対象の _J.html だけを読み込み
+                        j_bytes = z.read(j_file_map[doc_id])
+                        try:
+                            j_html = j_bytes.decode("cp932")
+                        except UnicodeDecodeError:
+                            j_html = j_bytes.decode("utf-8", errors="ignore")
+
+                        j_soup = BeautifulSoup(j_html, "html.parser")
+                        
+                        # 不要なタグ（スクリプトやスタイル）を除去
+                        for tag in j_soup(['script', 'style', 'noscript']):
+                            tag.decompose()
+
+                        # テキスト（条本文）のみ抽出
+                        full_text = j_soup.get_text(separator="\n", strip=True)
+
+                        processed_data.append({
+                            "id": doc_id,
+                            "title": item['title'],
+                            "text": full_text
+                        })
+                    else:
+                        missing_ids.append(doc_id)
+
+                    progress_bar.progress((idx + 1) / len(unique_categories))
+
+                st.success(f"🎉 処理完了! 成功: **{len(processed_data)} 件** / 未検出: **{len(missing_ids)} 件**")
+
+                if missing_ids:
+                    with st.expander("`_J.html` が存在しなかったID一覧"):
+                        st.write(missing_ids)
+
+                # --- C. 結果のプレビューとダウンロード ---
+                if processed_data:
+                    st.subheader("抽出データのプレビュー（先頭1件）")
+                    st.json(processed_data[0])
+
+                    json_string = json.dumps(processed_data, ensure_ascii=False, indent=2)
                     st.download_button(
-                        label="📦 変換済みテキスト（Zip）を一括ダウンロード",
-                        data=output_buffer,
-                        file_name="reiki_rag_texts.zip",
-                        mime="application/zip"
+                        label="JSONデータをダウンロード",
+                        data=json_string,
+                        file_name="reiki_extracted_data.json",
+                        mime="application/json"
                     )
                     
                 except Exception as e:
