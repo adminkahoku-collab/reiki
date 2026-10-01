@@ -9,7 +9,7 @@ from bs4 import BeautifulSoup
 # 画面基本設定
 st.set_page_config(page_title="例規データRAG変換ツール", page_icon="⚖️")
 st.title("⚖️ 例規HTMLデータ ➔ RAGテキスト変換ツール")
-st.write("DVDから抽出したZipファイルをアップロードすると、Dify用の最適化テキスト（Markdown）を生成してダウンロードできます。")
+st.write("DVDから抽出したZipファイルをアップロードすると、重複タイトルを除去したDify用Markdownを生成してダウンロードできます。")
 
 # 簡易パスワード認証
 password = st.text_input("職員用パスワードを入力してください", type="password")
@@ -52,7 +52,7 @@ if password == "reiki063215":
 
                 # 目次ファイルが見つかった場合のみ処理を実行
                 if target_bunya_file and j_files:
-                    if st.button("Dify用RAGデータ化（Markdown）を実行する"):
+                    if st.button("Dify用RAGデータ化（重複除去Markdown）を実行する"):
                         
                         # --- A. 目次ファイル (bunya_0010000.html) の解析 ---
                         bunya_bytes = z.read(target_bunya_file)
@@ -84,7 +84,7 @@ if password == "reiki063215":
 
                         st.write(f"✅ `bunya_0010000.html` から **{len(unique_categories)} 件** の例規タイトルを取得しました。")
 
-                        # --- B. 該当する _J.html のみを抽出・Markdownテキスト作成 ---
+                        # --- B. 該当する _J.html のみを抽出・整形 ---
                         j_file_map = {}
                         for path in j_files:
                             filename = path.split("/")[-1]
@@ -98,6 +98,7 @@ if password == "reiki063215":
 
                         for idx, item in enumerate(unique_categories):
                             doc_id = item['id']
+                            rule_title = item['title'].strip()
                             
                             if doc_id in j_file_map:
                                 j_bytes = z.read(j_file_map[doc_id])
@@ -111,10 +112,24 @@ if password == "reiki063215":
                                 for tag in j_soup(['script', 'style', 'noscript']):
                                     tag.decompose()
 
-                                full_text = j_soup.get_text(separator="\n", strip=True)
+                                raw_text = j_soup.get_text(separator="\n", strip=True)
+                                lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
 
-                                # Dify用にMarkdown形式で整形（識別IDを除外し、タイトルと本文のみにする）
-                                doc_markdown = f"# {item['title']}\n\n{full_text}\n\n---\n"
+                                # 【重複タイトルの除去処理】
+                                # 本文の先頭行付近にある例規タイトルや「○タイトル」表記の重複行を取り除く
+                                cleaned_lines = []
+                                title_pattern = re.compile(rf"^(○)?{re.escape(rule_title)}$")
+                                
+                                for line in lines:
+                                    # タイトルそのもの、あるいは「○タイトル」と完全一致する重複行を無効化
+                                    if title_pattern.match(line):
+                                        continue
+                                    cleaned_lines.append(line)
+
+                                cleaned_text = "\n".join(cleaned_lines)
+
+                                # Markdownとして組み上げる（# タイトル は最上部に1回だけ出力）
+                                doc_markdown = f"# {rule_title}\n\n{cleaned_text}\n\n---\n"
                                 markdown_contents.append(doc_markdown)
                             else:
                                 missing_ids.append(doc_id)
@@ -129,13 +144,11 @@ if password == "reiki063215":
 
                         # --- C. 結果のプレビューとダウンロード ---
                         if markdown_contents:
-                            # 1つの巨大テキストに結合
                             full_markdown_text = "\n".join(markdown_contents)
 
                             st.subheader("抽出データのプレビュー（先頭1件）")
                             st.code(markdown_contents[0], language="markdown")
 
-                            # Difyにそのまま投入できるMarkdown (.md) ファイルとしてダウンロード
                             st.download_button(
                                 label="Dify用Markdownデータをダウンロード (.md)",
                                 data=full_markdown_text.encode("utf-8"),
