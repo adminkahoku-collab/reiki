@@ -37,27 +37,23 @@ if password == "reiki063215":
                         # OpenResDataWin('xxxx') のJavaScript呼び出しを検出
                         re_link = re.compile(r"OpenResDataWin\('([^']+)'\)")
                         
-                        # 「第〇編」を検出する正規表現（全角数字・半角数字・漢数字・スペースに対応）
-                        re_hen = re.compile(r"第\s*[0-9０-9一二三四五六七八九十]+\s*編\s*.*")
+                        # 【修正箇所】半角0-9、全角０-９、漢数字をそれぞれ正しく範囲指定
+                        re_hen = re.compile(r"第\s*[0-9０-９一二三四五六七八九十]+\s*編.*")
 
                         hen_data = {}
                         current_hen = "00_未分類"
                         hen_counter = 0
 
                         # HTML要素をブロック単位で上から順に走査
-                        # tr, div, p, table など行・ブロックに相当する要素を探索
                         elements = bunya_soup.find_all(['tr', 'div', 'p', 'li'])
                         
                         for elem in elements:
-                            # タグ内のテキストを取得（空白詰めで判定）
                             raw_elem_text = elem.get_text(" ", strip=True)
                             
                             # 1. 「第〇編」という見出し文言が含まれているかチェック
                             hen_match = re_hen.search(raw_elem_text)
                             if hen_match:
-                                # 見出しテキストを抽出・ファイル名用にクレンジング
                                 matched_text = hen_match.group(0).split("\n")[0].strip()
-                                # 先頭に連番をつけてファイル並び順を固定（例: 01_第1編_総務）
                                 hen_counter += 1
                                 safe_hen_name = re.sub(r'[\\/:*?"<>|]', '_', matched_text)
                                 current_hen = f"{hen_counter:02d}_{safe_hen_name}"
@@ -67,7 +63,6 @@ if password == "reiki063215":
                                 continue
 
                             # 2. 例規リンク（JavaScript呼び出し）が含まれているかチェック
-                            # elem 内のすべての a タグや onclick 属性をチェック
                             for a_tag in elem.find_all(['a', 'td', 'div']):
                                 onclick_attr = a_tag.get('onclick', '') or a_tag.get('href', '')
                                 match = re_link.search(onclick_attr)
