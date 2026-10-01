@@ -34,49 +34,55 @@ if password == "reiki063215":
 
                         bunya_soup = BeautifulSoup(bunya_html, "html.parser")
                         
-                        # OpenResDataWin('xxxx') のJavaScript呼び出しを検出
+                        # JavaScript呼び出しパターン
                         re_link = re.compile(r"OpenResDataWin\('([^']+)'\)")
-                        
-                        # 【修正箇所】半角0-9、全角０-９、漢数字をそれぞれ正しく範囲指定
-                        re_hen = re.compile(r"第\s*[0-9０-９一二三四五六七八九十]+\s*編.*")
+                        # 「第〇編」判定パターン
+                        re_hen = re.compile(r"^第\s*[0-9０-９一二三四五六七八九十]+\s*編")
 
                         hen_data = {}
                         current_hen = "00_未分類"
                         hen_counter = 0
 
-                        # HTML要素をブロック単位で上から順に走査
-                        elements = bunya_soup.find_all(['tr', 'div', 'p', 'li'])
-                        
-                        for elem in elements:
-                            raw_elem_text = elem.get_text(" ", strip=True)
+                        # すべての要素を上から順に走査（aタグ、tdタグ、divタグ、pタグなど）
+                        # find_all(True) でDOMツリーを順序通りに走査
+                        for tag in bunya_soup.find_all(['td', 'th', 'div', 'p', 'a', 'tr']):
+                            # リンク（onclick等）があるかチェック
+                            onclick_attr = tag.get('onclick', '') or tag.get('href', '')
+                            match = re_link.search(onclick_attr)
                             
-                            # 1. 「第〇編」という見出し文言が含まれているかチェック
-                            hen_match = re_hen.search(raw_elem_text)
-                            if hen_match:
-                                matched_text = hen_match.group(0).split("\n")[0].strip()
-                                hen_counter += 1
-                                safe_hen_name = re.sub(r'[\\/:*?"<>|]', '_', matched_text)
-                                current_hen = f"{hen_counter:02d}_{safe_hen_name}"
-                                
-                                if current_hen not in hen_data:
-                                    hen_data[current_hen] = []
-                                continue
-
-                            # 2. 例規リンク（JavaScript呼び出し）が含まれているかチェック
-                            for a_tag in elem.find_all(['a', 'td', 'div']):
-                                onclick_attr = a_tag.get('onclick', '') or a_tag.get('href', '')
-                                match = re_link.search(onclick_attr)
-                                if match:
-                                    doc_id = match.group(1)
-                                    title = a_tag.get_text(strip=True)
+                            # 直下のテキストを取得
+                            text = tag.get_text(strip=True)
+                            
+                            # 1. リンクがない場合で、「第〇編」から始まる文字列があれば編を更新
+                            if not match and text and re_hen.match(text):
+                                # 長すぎる文字列は除外し、純粋な見出しテキストのみ取得
+                                if len(text) < 30:
+                                    # 重複更新を防止（同じ見出しタグを親・子で2回拾うのを防ぐ）
+                                    hen_title = re.sub(r'[\\/:*?"<>|]', '_', text)
+                                    new_hen_name = f"{hen_counter + 1:02d}_{hen_title}"
                                     
-                                    if title and doc_id:
+                                    if new_hen_name != current_hen:
+                                        hen_counter += 1
+                                        current_hen = new_hen_name
                                         if current_hen not in hen_data:
                                             hen_data[current_hen] = []
-                                        
-                                        # 重複追加の防止
-                                        if not any(d['id'] == doc_id for d in hen_data[current_hen]):
-                                            hen_data[current_hen].append({"id": doc_id, "title": title})
+                            
+                            # 2. リンク（例規）が見つかった場合、現在の編に追加
+                            elif match:
+                                doc_id = match.group(1)
+                                rule_title = text
+                                
+                                if rule_title and doc_id:
+                                    if current_hen not in hen_data:
+                                        hen_data[current_hen] = []
+                                    
+                                    # 重複追加の防止
+                                    if not any(d['id'] == doc_id for d in hen_data[current_hen]):
+                                        hen_data[current_hen].append({"id": doc_id, "title": rule_title})
+
+                        # 不要な未分類枠が空なら削除
+                        if "00_未分類" in hen_data and len(hen_data["00_未分類"]) == 0:
+                            del hen_data["00_未分類"]
 
                         # ZIP出力の準備
                         output_zip_buffer = io.BytesIO()
