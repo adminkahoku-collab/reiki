@@ -4,7 +4,7 @@ import io
 import re
 from bs4 import BeautifulSoup
 
-st.set_page_config(page_title="例規13編自動分割ツール", page_icon="⚖️️")
+st.set_page_config(page_title="例規13編自動分割ツール", page_icon="⚖")
 st.title("⚖️ 例規13編ファイル自動分割・Dify軽量化ツール")
 
 password = st.text_input("職員用パスワードを入力してください", type="password")
@@ -33,33 +33,55 @@ if password == "reiki063215":
                             bunya_html = bunya_bytes.decode("utf-8", errors="ignore")
 
                         bunya_soup = BeautifulSoup(bunya_html, "html.parser")
+                        
+                        # OpenResDataWin('xxxx') のJavaScript呼び出しを検出
                         re_link = re.compile(r"OpenResDataWin\('([^']+)'\)")
                         
-                        # 編（カテゴリー）ごとにデータを収集する辞書
-                        # key: 編の名前, value: 例規のリスト
+                        # 「第〇編」を検出する正規表現（全角数字・半角数字・漢数字・スペースに対応）
+                        re_hen = re.compile(r"第\s*[0-9０-9一二三四五六七八九十]+\s*編\s*.*")
+
                         hen_data = {}
                         current_hen = "00_未分類"
+                        hen_counter = 0
 
-                        for elem in bunya_soup.find_all(['tr', 'td', 'div', 'p', 'a']):
-                            text = elem.get_text(strip=True)
+                        # HTML要素をブロック単位で上から順に走査
+                        # tr, div, p, table など行・ブロックに相当する要素を探索
+                        elements = bunya_soup.find_all(['tr', 'div', 'p', 'li'])
+                        
+                        for elem in elements:
+                            # タグ内のテキストを取得（空白詰めで判定）
+                            raw_elem_text = elem.get_text(" ", strip=True)
                             
-                            # 「第○編」という見出し行を検知した場合
-                            if "第" in text and "編" in text and len(text) < 20:
-                                current_hen = re.sub(r'[\\/:*?"<>|]', '_', text)
+                            # 1. 「第〇編」という見出し文言が含まれているかチェック
+                            hen_match = re_hen.search(raw_elem_text)
+                            if hen_match:
+                                # 見出しテキストを抽出・ファイル名用にクレンジング
+                                matched_text = hen_match.group(0).split("\n")[0].strip()
+                                # 先頭に連番をつけてファイル並び順を固定（例: 01_第1編_総務）
+                                hen_counter += 1
+                                safe_hen_name = re.sub(r'[\\/:*?"<>|]', '_', matched_text)
+                                current_hen = f"{hen_counter:02d}_{safe_hen_name}"
+                                
                                 if current_hen not in hen_data:
                                     hen_data[current_hen] = []
-                            
-                            # 例規へのリンクを検知した場合
-                            onclick_attr = elem.get('onclick', '') or elem.get('href', '')
-                            match = re_link.search(onclick_attr)
-                            if match:
-                                doc_id = match.group(1)
-                                title = text
-                                if current_hen not in hen_data:
-                                    hen_data[current_hen] = []
-                                # 重複追加の防止
-                                if not any(d['id'] == doc_id for d in hen_data[current_hen]):
-                                    hen_data[current_hen].append({"id": doc_id, "title": title})
+                                continue
+
+                            # 2. 例規リンク（JavaScript呼び出し）が含まれているかチェック
+                            # elem 内のすべての a タグや onclick 属性をチェック
+                            for a_tag in elem.find_all(['a', 'td', 'div']):
+                                onclick_attr = a_tag.get('onclick', '') or a_tag.get('href', '')
+                                match = re_link.search(onclick_attr)
+                                if match:
+                                    doc_id = match.group(1)
+                                    title = a_tag.get_text(strip=True)
+                                    
+                                    if title and doc_id:
+                                        if current_hen not in hen_data:
+                                            hen_data[current_hen] = []
+                                        
+                                        # 重複追加の防止
+                                        if not any(d['id'] == doc_id for d in hen_data[current_hen]):
+                                            hen_data[current_hen].append({"id": doc_id, "title": title})
 
                         # ZIP出力の準備
                         output_zip_buffer = io.BytesIO()
@@ -106,7 +128,12 @@ if password == "reiki063215":
                                 file_filename = f"{hen_name}.md"
                                 out_zip.writestr(file_filename, hen_markdown.encode("utf-8"))
 
-                        st.success(f"🎉 処理完了! 合計 {len(hen_data)} 編（{total_docs} 件の例規）のマークダウンを生成しました。")
+                        st.success(f"🎉 処理完了! 合計 {len(hen_data)} つの分類（{total_docs} 件の例規）のマークダウンを生成しました。")
+
+                        # 分割されたファイル一覧のプレビュー
+                        with st.expander("生成されたファイル一覧を確認"):
+                            for h_name, h_items in hen_data.items():
+                                st.write(f"📁 **{h_name}.md** ({len(h_items)} 件)")
 
                         # ZIPダウンロードボタン
                         st.download_button(
@@ -118,3 +145,9 @@ if password == "reiki063215":
 
         except Exception as e:
             st.error(f"エラーが発生しました: {str(e)}")
+
+else:
+    if password:
+        st.error("パスワードが違います。")
+    else:
+        st.warning("正しいパスワードを入力すると操作パネルが表示されます。")
