@@ -9,12 +9,12 @@ from bs4 import BeautifulSoup
 # 画面基本設定
 st.set_page_config(page_title="例規データRAG変換ツール", page_icon="⚖️")
 st.title("⚖️ 例規HTMLデータ ➔ RAGテキスト変換ツール")
-st.write("DVDから抽出したZipファイルをアップロードすると、13編のRAG用テキストを生成して一括ダウンロードできます。")
+st.write("DVDから抽出したZipファイルをアップロードすると、Dify用の最適化テキスト（Markdown）を生成してダウンロードできます。")
 
 # 簡易パスワード認証
 password = st.text_input("職員用パスワードを入力してください", type="password")
 
-if password == "reiki063215":  # ← 必要に応じて変更してください
+if password == "reiki063215":
     st.success("認証されました。")
     st.markdown("---")
     
@@ -29,10 +29,9 @@ if password == "reiki063215":  # ← 必要に応じて変更してください
                 all_files = z.namelist()
                 
                 # --- 【ファイル特定の厳格化】 ---
-                # bunya0010000.html や bunya_0010000.html などの特定ファイル名のみを検索
                 target_bunya_file = None
                 for f in all_files:
-                    filename = f.split("/")[-1].lower()  # フォルダ階層を無視してファイル名のみで判定
+                    filename = f.split("/")[-1].lower()
                     if filename in ["bunya_0010000.html", "bunya0010000.html"]:
                         target_bunya_file = f
                         break
@@ -53,7 +52,7 @@ if password == "reiki063215":  # ← 必要に応じて変更してください
 
                 # 目次ファイルが見つかった場合のみ処理を実行
                 if target_bunya_file and j_files:
-                    if st.button("絞り込みデータ化を実行する"):
+                    if st.button("Dify用RAGデータ化（Markdown）を実行する"):
                         
                         # --- A. 目次ファイル (bunya_0010000.html) の解析 ---
                         bunya_bytes = z.read(target_bunya_file)
@@ -66,7 +65,6 @@ if password == "reiki063215":  # ← 必要に応じて変更してください
                         re_link = re.compile(r"OpenResDataWin\('([^']+)'\)")
                         
                         categories = []
-                        # 目次内のリンク要素を抽出
                         for elem in bunya_soup.find_all(['td', 'div', 'p', 'a']):
                             onclick_attr = elem.get('onclick', '') or elem.get('href', '')
                             match = re_link.search(onclick_attr)
@@ -84,17 +82,16 @@ if password == "reiki063215":  # ← 必要に応じて変更してください
                                 seen.add(item['id'])
                                 unique_categories.append(item)
 
-                        st.write(f"✅ `bunya_0010000.html` から **{len(unique_categories)} 件** の例規IDを取得しました。")
+                        st.write(f"✅ `bunya_0010000.html` から **{len(unique_categories)} 件** の例規タイトルを取得しました。")
 
-                        # --- B. 該当する _J.html のみを抽出・パース ---
-                        # 高速参照用に _J ファイルのマップを作成
+                        # --- B. 該当する _J.html のみを抽出・Markdownテキスト作成 ---
                         j_file_map = {}
                         for path in j_files:
                             filename = path.split("/")[-1]
                             doc_id = filename.replace("_J.html", "").replace("_j.html", "")
                             j_file_map[doc_id] = path
 
-                        processed_data = []
+                        markdown_contents = []
                         missing_ids = []
 
                         progress_bar = st.progress(0)
@@ -103,7 +100,6 @@ if password == "reiki063215":  # ← 必要に応じて変更してください
                             doc_id = item['id']
                             
                             if doc_id in j_file_map:
-                                # 対象の _J.html だけを読み込み
                                 j_bytes = z.read(j_file_map[doc_id])
                                 try:
                                     j_html = j_bytes.decode("cp932")
@@ -112,40 +108,39 @@ if password == "reiki063215":  # ← 必要に応じて変更してください
 
                                 j_soup = BeautifulSoup(j_html, "html.parser")
                                 
-                                # 不要なタグ（スクリプトやスタイル）を除去
                                 for tag in j_soup(['script', 'style', 'noscript']):
                                     tag.decompose()
 
-                                # テキスト（条本文）のみ抽出
                                 full_text = j_soup.get_text(separator="\n", strip=True)
 
-                                processed_data.append({
-                                    "id": doc_id,
-                                    "title": item['title'],
-                                    "text": full_text
-                                })
+                                # Dify用にMarkdown形式で整形（識別IDを除外し、タイトルと本文のみにする）
+                                doc_markdown = f"# {item['title']}\n\n{full_text}\n\n---\n"
+                                markdown_contents.append(doc_markdown)
                             else:
                                 missing_ids.append(doc_id)
 
                             progress_bar.progress((idx + 1) / len(unique_categories))
 
-                        st.success(f"🎉 処理完了! 成功: **{len(processed_data)} 件** / 未検出: **{len(missing_ids)} 件**")
+                        st.success(f"🎉 処理完了! 成功: **{len(markdown_contents)} 件** / 未検出: **{len(missing_ids)} 件**")
 
                         if missing_ids:
                             with st.expander("`_J.html` が存在しなかったID一覧"):
                                 st.write(missing_ids)
 
                         # --- C. 結果のプレビューとダウンロード ---
-                        if processed_data:
-                            st.subheader("抽出データのプレビュー（先頭1件）")
-                            st.json(processed_data[0])
+                        if markdown_contents:
+                            # 1つの巨大テキストに結合
+                            full_markdown_text = "\n".join(markdown_contents)
 
-                            json_string = json.dumps(processed_data, ensure_ascii=False, indent=2)
+                            st.subheader("抽出データのプレビュー（先頭1件）")
+                            st.code(markdown_contents[0], language="markdown")
+
+                            # Difyにそのまま投入できるMarkdown (.md) ファイルとしてダウンロード
                             st.download_button(
-                                label="JSONデータをダウンロード",
-                                data=json_string,
-                                file_name="reiki_extracted_data.json",
-                                mime="application/json"
+                                label="Dify用Markdownデータをダウンロード (.md)",
+                                data=full_markdown_text.encode("utf-8"),
+                                file_name="reiki_rag_data.md",
+                                mime="text/markdown"
                             )
 
         except Exception as e:
