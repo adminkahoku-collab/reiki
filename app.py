@@ -246,64 +246,70 @@ if uploaded_base_zip is not None:
                 md_files,
             )
 
-# --- ステップ2の AIキーワード付与処理（修正版） ---
-if st.button(f"🤖 「{selected_md_file}」にAIキーワードを付与して保存"):
-    content = z.read(selected_md_file).decode("utf-8")
+            # --- ステップ2の AIキーワード付与処理 ---
+            if st.button(
+                f"🤖 「{selected_md_file}」にAIキーワードを付与して保存"
+            ):
+                content = z.read(selected_md_file).decode("utf-8")
 
-    # `---` (水平線) で各例規のブロックごとに分割する
-    blocks = content.split("\n---\n")
+                # `---` (水平線) で各例規のブロックごとに分割する
+                blocks = content.split("\n---\n")
 
-    ai_enhanced_markdown = ""
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    total_blocks = len(blocks)
+                ai_enhanced_markdown = ""
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                total_blocks = len(blocks)
 
-    for idx, block in enumerate(blocks):
-        block_str = block.strip()
-        if not block_str:
-            continue
+                for idx, block in enumerate(blocks):
+                    block_str = block.strip()
+                    if not block_str:
+                        continue
 
-        progress_bar.progress((idx + 1) / total_blocks)
+                    progress_bar.progress((idx + 1) / total_blocks)
 
-        # 最最初（ファイルヘッダー # 01_第１編...）の処理
-        if block_str.startswith("# "):
-            ai_enhanced_markdown += block_str + "\n\n---\n\n"
-            continue
+                    # 最初（ファイルヘッダー # 01_第１編...）の処理
+                    if block_str.startswith("# "):
+                        ai_enhanced_markdown += block_str + "\n\n---\n\n"
+                        continue
 
-        # ## 見出しからタイトルと本文を正しく抽出
-        match = re.search(r"^##\s*(.*?)\n(.*)", block_str, re.DOTALL)
-        if match:
-            rule_title = match.group(1).strip()
-            rule_content = match.group(2).strip()
+                    # ## 見出しからタイトルと本文を正しく抽出
+                    match = re.search(
+                        r"^##\s*(.*?)\n(.*)", block_str, re.DOTALL
+                    )
+                    if match:
+                        rule_title = match.group(1).strip()
+                        rule_content = match.group(2).strip()
 
-            status_text.text(
-                f"AI解析中 ({idx + 1}/{total_blocks}): {rule_title}"
-            )
+                        status_text.text(
+                            f"AI解析中 ({idx + 1}/{total_blocks}): {rule_title}"
+                        )
 
-            # タイトルが存在する場合は Gemini に投げる
-            if rule_title:
-                keywords = generate_keywords_with_gemini(
-                    rule_title, rule_content, gemini_api_key
+                        # タイトルが存在する場合は Gemini に投げる
+                        if rule_title:
+                            keywords = generate_keywords_with_gemini(
+                                rule_title, rule_content, gemini_api_key
+                            )
+                            time.sleep(12)  # 無料枠制限（5 RPM）回避
+                        else:
+                            keywords = rule_title
+
+                        # 正しい構造（キーワード ➔ ## タイトル ➔ 本文）で組み立て
+                        ai_enhanced_markdown += (
+                            f"<!-- 検索キーワード: {keywords} -->\n"
+                        )
+                        ai_enhanced_markdown += (
+                            f"## {rule_title}\n{rule_content}\n\n---\n\n"
+                        )
+                    else:
+                        # マッチしない場合はそのまま保持
+                        ai_enhanced_markdown += block_str + "\n\n---\n\n"
+
+                st.success(
+                    f"🎉 「{selected_md_file}」のAIキーワード付与が完了しました！"
                 )
-                time.sleep(12)  # 無料枠制限（5 RPM）回避
-            else:
-                keywords = rule_title
-
-            # 正しい構造（キーワード ➔ ## タイトル ➔ 本文）で組み立て
-            ai_enhanced_markdown += f"<!-- 検索キーワード: {keywords} -->\n"
-            ai_enhanced_markdown += (
-                f"## {rule_title}\n{rule_content}\n\n---\n\n"
-            )
-        else:
-            # マッチしない場合はそのまま保持
-            ai_enhanced_markdown += block_str + "\n\n---\n\n"
-
-    st.success(
-        f"🎉 「{selected_md_file}」のAIキーワード付与が完了しました！"
-    )
-    st.download_button(
-        label=f"📥 {selected_md_file} (完成版) をダウンロード",
-        data=ai_enhanced_markdown.encode("utf-8"),
-        file_name=selected_md_file,
-        mime="text/markdown",
-    )
+                st.download_button(
+                    label=f"📥 {selected_md_file} (完成版) をダウンロード",
+                    data=ai_enhanced_markdown.encode("utf-8"),
+                    file_name=selected_md_file,
+                    mime="text/markdown",
+                )
