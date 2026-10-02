@@ -2,6 +2,7 @@ import streamlit as st
 import zipfile
 import io
 import re
+import time  # 先頭に追加
 from bs4 import BeautifulSoup
 from google import genai
 
@@ -12,13 +13,12 @@ st.title("⚖️ 例規13編ファイル自動分割・AIキーワード付与�
 gemini_api_key = st.secrets.get("GEMINI_API_KEY", "")
 
 # --- Gemini による検索キーワード自動生成関数 ---
-def generate_keywords_with_gemini(title: str, content: str, api_key: str) -> str:
-    """
-    Gemini 3.6 Flash を使用して、例規のBM25検索補強用キーワード（単語群）を自動生成する関数
-    """
+def generate_keywords_with_gemini(
+    title: str, content: str, api_key: str
+) -> str:
+    """Gemini 3.6 Flash を使用して、例規の検索用キーワードを自動生成する関数（429エラー自動待機付き）"""
     if not api_key:
-        # APIキーがSecretsに設定されていない場合のフォールバック
-        return f"{title} 申請 手当"
+        return f"{title}"
 
     prompt = f"""
 あなたは自治体例規集（RAGシステム）のインデックス作成アシスタントです。
@@ -26,7 +26,6 @@ def generate_keywords_with_gemini(title: str, content: str, api_key: str) -> str
 
 【出力条件】
 1. 例規名（{title}）に直接含まれない同義語、類義語、関連する実務用語、略称を優先して抽出してください。
-   （例：『河北町弔慰規程』の場合 ➔ 弔慰金 香典 弔詞 死亡 特別職 職員 町長 副町長 遺族 支給 死亡給付）
 2. 「条例」「規則」「規程」「に関する」「について」などの一般的・形式的な言葉は除外してください。
 3. 単語のみを「半角スペース区切り」で1行で出力してください（説明文や余計な記号は一切含めないでください）。
 
@@ -35,21 +34,38 @@ def generate_keywords_with_gemini(title: str, content: str, api_key: str) -> str
 本文冒頭: {content[:1000]}
 """
 
-    try:
-        client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(
-            model='gemini-3.6-flash',
-            contents=prompt,
-        )
-        
-        keywords = response.text.strip()
-        # クレンジング処理（改行やカンマの除去）
-        keywords = keywords.replace("\n", " ").replace("、", " ").replace(",", " ").replace("<!--", "").replace("-->", "")
-        return keywords
-    except Exception as e:
-        st.warning(f"Gemini API呼び出しエラー ({title}): {e}")
-        return f"{title} 申請 手当"
+    client = genai.Client(api_key=api_key)
 
+    # 429エラー発生時に自動で再試行するループ
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            response = client.models.generate_content(
+                model="gemini-3.6-flash", contents=prompt
+            )
+
+            keywords = response.text.strip()
+            # クレンジング処理
+            keywords = (
+                keywords.replace("\n", " ")
+                .replace("、", " ")
+                .replace(",", " ")
+                .replace("<!--", "")
+                .replace("-->", "")
+            )
+            return keywords
+
+        except Exception as e:
+            error_str = str(e)
+            if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+                # レート制限エラーの場合は15秒待ってリトライ
+                time.sleep(15)
+            else:
+                st.warning(f"Gemini APIエラー ({title}): {e}")
+                break
+
+    # 最終的にリトライオーバーした場合のフォールバック
+    return f"{title}"
 
 # --- メイン画面処理 ---
 # APIキー取得の事前チェック
