@@ -80,7 +80,7 @@ def generate_keywords_with_ollama(
 本文冒頭: {content[:1000]}
 """
 
-    url = "http://localhost:11434/api/generate"
+    url = "http://127.0.0.1:11434/api/generate"
     payload = {
         "model": model_name,
         "prompt": prompt,
