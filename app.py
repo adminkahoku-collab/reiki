@@ -18,40 +18,6 @@ password = st.sidebar.text_input("職員用パスワード", type="password")
 gemini_api_key = st.secrets.get("GEMINI_API_KEY", "")
 
 
-# --- Geminiによるキーワード自動生成関数 ---
-def generate_keywords_with_gemini(
-    title: str, content: str, api_key: str
-) -> str:
-  """Gemini を使用して例規のBM25検索補強用キーワードを自動生成"""
-  if not api_key:
-    return f"{title} 申請 手当"
-
-  prompt = f"""
-あなたは自治体例規集（RAGシステム）のインデックス作成アシスタントです。
-以下の例規の「タイトル」と「本文」を読み、住民や職員が検索する際に使用しそうな「検索キーワード（単語）」を抽出・補完してください。
-
-【出力条件】
-1. 例規名（{title}）に直接含まれない同義語、類義語、関連する実務用語、略称を優先して抽出してください。
-2. 「条例」「規則」「規程」「に関する」「について」などの一般的・形式的な言葉は除外してください。
-3. 単語のみを「半角スペース区切り」で1行で出力してください。
-
-【対象例規】
-タイトル: {title}
-本文冒頭: {content[:1000]}
-"""
-  try:
-    client = genai.Client(api_key=api_key)
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt,
-    )
-    keywords = response.text.strip()
-    return keywords.replace("\n", " ").replace("、", " ").replace(",", " ")
-  except Exception as e:
-    st.warning(f"Gemini API（キーワード生成）でエラー ({title}): {e}")
-    return f"{title} 手当 申請"
-
-
 # --- Geminiによる例規ごとの要約生成関数 ---
 def generate_summary_with_gemini(
     title: str, content: str, api_key: str
@@ -92,11 +58,11 @@ if password == "reiki063215":
   if not gemini_api_key:
     st.info(
         "💡 .streamlit/secrets.toml に GEMINI_API_KEY"
-        " が設定されていない場合、キーワード/要約の生成は簡易表示になります。"
+        " が設定されていない場合、ステップ2の要約生成は簡易表示になります。"
     )
 
   # ==========================================
-  # ステップ1: 元データ(ZIP)から13編Markdownを作成
+  # ステップ1: 元データ(ZIP)から13編Markdownを作成 (AIキーワード不要)
   # ==========================================
   st.header("ステップ1: 元データ(ZIP)から13編Markdownを作成")
   uploaded_html_zip = st.file_uploader(
@@ -106,7 +72,7 @@ if password == "reiki063215":
   )
 
   if uploaded_html_zip is not None:
-    if st.button("⚖️ 1. 例規マークダウン作成（13編分割 & AIキーワード付与）"):
+    if st.button("⚖️ 1. 例規マークダウン作成（13編分割）"):
       try:
         zip_buffer = io.BytesIO(uploaded_html_zip.read())
         with zipfile.ZipFile(zip_buffer, "r") as z:
@@ -235,12 +201,7 @@ if password == "reiki063215":
                     ]
                     cleaned_text = "\n".join(cleaned_lines)
 
-                    # Geminiキーワード生成（Secretsから自動補給）
-                    keywords = generate_keywords_with_gemini(
-                        rule_title, cleaned_text, gemini_api_key
-                    )
-
-                    hen_markdown += f"<!-- 検索キーワード: {keywords} -->\n"
+                    # キーワード生成を排除し、直接見出しと本文を追加
                     hen_markdown += (
                         f"## {rule_title}\n\n{cleaned_text}\n\n---\n\n"
                     )
