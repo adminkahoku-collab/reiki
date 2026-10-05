@@ -1,374 +1,199 @@
 import io
-import re
 import os
+import re
 import time
 import zipfile
-from bs4 import BeautifulSoup
-from google import genai
+import google.generativeai as genai
 import streamlit as st
-import json
-import urllib.request
 
+# --- ページ設定 ---
 st.set_page_config(
-    page_title="例規13編自動分割＆AIキーワード付与ツール",
-    page_icon="⚖",
-    layout="wide",
+    page_title="例規ナレッジ化処理ツール", layout="wide"
 )
-st.title("⚖️ 例規ファイル自動分割・AIキーワード付与ツール")
 
-gemini_api_key = st.secrets.get("GEMINI_API_KEY", "")
+# --- 1. パスワード認証機能 ---
+PASSWORD = "reiki063215"
+
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+
+if not st.session_state.authenticated:
+    st.title("🔒 例規データ変換システム")
+    input_pwd = st.text_input("パスワードを入力してください", type="password")
+    if st.button("ログイン"):
+        if input_pwd == PASSWORD:
+            st.session_state.authenticated = True
+            st.rerun()
+        else:
+            st.error("パスワードが正しくありません。")
+    st.stop()
 
 
-# --- Gemini API によるキーワード生成関数 ---
-def generate_keywords_with_gemini(
-    title: str, content: str, api_key: str
-) -> str:
+# --- 2. メイン画面 ---
+st.title("📄 例規データ ナレッジ化処理システム")
+st.caption("第1段階: Markdown変換 & ボリューム確認 ➔ 第2段階: 無償API要約付与")
+
+# サイドバー設定
+st.sidebar.header("設定")
+api_key = st.sidebar.text_input(
+    "Gemini API Key (Free Tier)", type="password"
+)
+
+# セッション状態の初期化
+if "converted_files" not in st.session_state:
+    st.session_state.converted_files = {}
+
+
+# --- 第1段階：Markdown化とボリューム把握 ---
+st.header("【第1段階】Markdownファイルの読み込みとボリューム確認")
+
+uploaded_files = st.file_uploader(
+    "1段階目の標準Markdownファイル（複数可）を選択してください",
+    type=["md"],
+    accept_multiple_files=True,
+)
+
+if uploaded_files:
+    total_rules_count = 0
+    file_rule_mapping = {}
+
+    # ボリュームの解析
+    for uploaded_file in uploaded_files:
+        content = uploaded_file.read().decode("utf-8")
+        uploaded_file.seek(0)  # ポインタを戻す
+
+        # '## ' の見出し数をカウント（条例数）
+        rules = re.findall(r"^##\s+(.+)$", content, re.MULTILINE)
+        rule_count = len(rules)
+
+        file_rule_mapping[uploaded_file.name] = {
+            "content": content,
+            "rule_count": rule_count,
+        }
+        total_rules_count += rule_count
+
+    st.session_state.converted_files = file_rule_mapping
+
+    # ボリューム情報の表示
+    col1, col2, col3 = st.columns(3)
+    col1.metric("総ファイル数", f"{len(uploaded_files)} 件")
+    col2.metric("総条例（##）数", f"{total_rules_count} 件")
+
+    # 無償API (15 RPM -> 1件約4.5秒待機) の場合の所要時間計算
+    estimated_seconds = total_rules_count * 4.5
+    est_min = int(estimated_seconds // 60)
+    est_sec = int(estimated_seconds % 60)
+    col3.metric("第2段階の予想処理時間", f"約 {est_min}分 {est_sec}秒")
+
+    st.info(
+        f"💡 ボリューム確認完了: 合計 **{total_rules_count} 件** の条例が見つかりました。第2段階の処理を開始できます。"
+    )
+
+    st.divider()
+
+    # --- 第2段階：無償APIによる要約付与処理 ---
+    st.header("【第2段階】要約・タグの自動付与（Gemini API）")
+
     if not api_key:
-        return f"{title}"
-
-    prompt = f"""
-あなたは自治体例規集のインデックス作成アシスタントです。
-以下の例規の「タイトル」と「本文」を読み、検索用の補完キーワード（単語）を抽出してください。
-
-【出力条件】
-1. 例規名（{title}）に含まれない同義語、類義語、実務用語を優先抽出してください。
-2. 「条例」「規則」等の形式単語は除外してください。
-3. 半角スペース区切りの単語列のみを1行で出力してください。
-
-【対象例規】
-タイトル: {title}
-本文冒頭: {content[:1000]}
-"""
-    client = genai.Client(api_key=api_key)
-
-    for attempt in range(3):
-        try:
-            response = client.models.generate_content(
-                model="gemini-3.6-flash", contents=prompt
-            )
-            keywords = response.text.strip()
-            keywords = (
-                keywords.replace("\n", " ")
-                .replace("、", " ")
-                .replace(",", " ")
-                .replace("<!--", "")
-                .replace("-->", "")
-            )
-            return keywords
-        except Exception as e:
-            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
-                time.sleep(15)
-            else:
-                break
-    return f"{title}"
-
-# --- Ollama (qwen2.5:7b) によるキーワード生成関数 ---
-def generate_keywords_with_ollama(
-    title: str, content: str, model_name: str = "qwen2.5:7b"
-) -> str:
-    # ★ Pythonプロセス全体でローカル通信のプロキシ利用を無効化（追加）
-    os.environ["NO_PROXY"] = "127.0.0.1,localhost"
-    os.environ["no_proxy"] = "127.0.0.1,localhost"
-    prompt = f"""
-あなたは自治体例規集のインデックス作成アシスタントです。
-以下の例規の「タイトル」と「本文」を読み、検索用の補完キーワード（単語）を抽出してください。
-
-【厳格な出力条件】
-1. 例規名（{title}）に含まれていない同義語、類義語、関連する実務用語・対象分野のみを抽出してください。
-2. 例規名そのもの（「{title}」）や、「条例」「規則」「規程」「に関する」などの形式単語は【絶対に含めないでください】。
-3. 半角スペース区切りの単語列のみを1行で出力してください。
-4. 例: 「休日 執務時間 閉庁日 年末年始」
-
-【対象例規】
-タイトル: {title}
-本文冒頭: {content[:1000]}
-"""
-
-    url = "http://127.0.0.1:11434/api/generate"
-    payload = {
-        "model": model_name,
-        "prompt": prompt,
-        "stream": False,
-    }
-
-    try:
-        req = urllib.request.Request(
-            url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
+        st.warning(
+            "⚠️ 第2段階を進めるには、サイドバーに Gemini API Key を入力してください。"
         )
-        # CPU推論用にタイムアウトを180秒に設定
-        with urllib.request.urlopen(req, timeout=180) as res:
-            result = json.loads(res.read().decode("utf-8"))
-            keywords = result.get("response", "").strip()
+    else:
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel("gemini-3.6-flash")
 
-            keywords = (
-                keywords.replace("\n", " ")
-                .replace("、", " ")
-                .replace(",", " ")
-                .replace("<!--", "")
-                .replace("-->", "")
-            )
-            return keywords
-    except Exception as e:
-        st.error(f"Ollama処理エラー ({title}): {e}")
-        return ""
+        if st.button("🚀 要約の自動付与を開始する"):
+            progress_bar = st.progress(0)
+            status_area = st.empty()
+            time_area = st.empty()
 
-# =========================================================
-# 【ステップ1】HTMLから全13編のベースMarkdown(ZIP)を一括作成
-# =========================================================
-st.header("1️⃣ ステップ1: ベースMarkdown（全13編ZIP）の作成")
-st.caption(
-    "元データのZIPをアップロードし、テキスト抽出済みのベースMarkdownを作成・ダウンロードします（AI不使用・数秒で完了）。"
-)
+            start_time = time.time()
+            processed_rules_count = 0
+            final_files = {}
 
-uploaded_html_zip = st.file_uploader(
-    "元データのZIPファイルをアップロードしてください",
-    type=["zip"],
-    key="step1_uploader",
-)
+            # 要約生成関数
+            def get_summary(title, text_content):
+                prompt = f"""
+あなたは自治体例規の整理補助AIです。
+以下の例規の「タイトル」と「本文」を読み、概要とカテゴリを以下のフォーマットで短く出力してください。
 
-if uploaded_html_zip is not None:
-    if st.button("🚀 ベースMarkdown (全13編ZIP) を生成"):
-        zip_buffer = io.BytesIO(uploaded_html_zip.read())
-        with zipfile.ZipFile(zip_buffer, "r") as z:
-            all_files = z.namelist()
-            target_bunya = next(
-                (
-                    f
-                    for f in all_files
-                    if f.split("/")[-1].lower()
-                    in ["bunya_0010000.html", "bunya0010000.html"]
-                ),
-                None,
-            )
-            j_files = {
-                f.split("/")[-1]
-                .replace("_J.html", "")
-                .replace("_j.html", ""): f
-                for f in all_files
-                if f.lower().endswith("_j.html")
-            }
+【対象例規】
+タイトル: {title}
+本文冒頭: {text_content[:1000]}
 
-            if target_bunya:
-                bunya_bytes = z.read(target_bunya)
+【出力フォーマット】
+概要：[1〜2文で何について定めたものか] / 対象カテゴリ：[関連する検索単語や分野をカンマ区切りで3〜5個]
+"""
                 try:
-                    bunya_html = bunya_bytes.decode("cp932")
-                except UnicodeDecodeError:
-                    bunya_html = bunya_bytes.decode("utf-8", errors="ignore")
+                    res = model.generate_content(prompt)
+                    time.sleep(4.0)  # 無償枠のレート制限対策（1分間15回まで）
+                    return res.text.strip().replace("\n", " ")
+                except Exception as e:
+                    time.sleep(8.0)
+                    return "概要の自動生成に失敗しました"
 
-                bunya_soup = BeautifulSoup(bunya_html, "html.parser")
-                re_link = re.compile(r"OpenResDataWin\('([^']+)'\)")
-                re_hen = re.compile(
-                    r"第\s*[0-9０-９一二三四五六七八九十]+\s*編\s*.*"
-                )
-
-                hen_data = {}
-                current_hen = "00_未分類"
-                hen_counter = 0
-
-                for elem in bunya_soup.find_all(["strong", "tr", "p", "div"]):
-                    if elem.name == "strong":
-                        lines = [
-                            line.strip()
-                            for line in elem.get_text("\n", strip=True).split(
-                                "\n"
-                            )
-                            if line.strip()
-                        ]
-                        for line in lines:
-                            hen_match = re_hen.search(line)
-                            if hen_match:
-                                matched_text = hen_match.group(0).strip()
-                                clean_text = re.sub(
-                                    r'[\\/:*?"<>|]', "_", matched_text
-                                )
-                                if not current_hen.endswith(clean_text):
-                                    hen_counter += 1
-                                    current_hen = (
-                                        f"{hen_counter:02d}_{clean_text}"
-                                    )
-                                    if current_hen not in hen_data:
-                                        hen_data[current_hen] = []
-                    elif elem.name == "tr":
-                        for a_tag in elem.find_all("a"):
-                            onclick_attr = a_tag.get("href", "") or a_tag.get(
-                                "onclick", ""
-                            )
-                            match = re_link.search(onclick_attr)
-                            if match:
-                                doc_id = match.group(1)
-                                title = a_tag.get_text(strip=True)
-                                if title and doc_id:
-                                    if current_hen not in hen_data:
-                                        hen_data[current_hen] = []
-                                    if not any(
-                                        d["id"] == doc_id
-                                        for d in hen_data[current_hen]
-                                    ):
-                                        hen_data[current_hen].append(
-                                            {"id": doc_id, "title": title}
-                                        )
-
-                if "00_未分類" in hen_data and len(hen_data["00_未分類"]) == 0:
-                    del hen_data["00_未分類"]
-
-                # ZIPファイル書き込み
-                base_zip_buffer = io.BytesIO()
-                with zipfile.ZipFile(
-                    base_zip_buffer, "w", zipfile.ZIP_DEFLATED
-                ) as out_zip:
-                    for hen_name, items in hen_data.items():
-                        if not items:
-                            continue
-                        hen_markdown = f"# {hen_name}\n\n"
-                        for item in items:
-                            doc_id = item["id"]
-                            rule_title = item["title"]
-                            if doc_id in j_files:
-                                j_bytes = z.read(j_files[doc_id])
-                                try:
-                                    j_html = j_bytes.decode("cp932")
-                                except UnicodeDecodeError:
-                                    j_html = j_bytes.decode(
-                                        "utf-8", errors="ignore"
-                                    )
-
-                                j_soup = BeautifulSoup(j_html, "html.parser")
-                                for tag in j_soup(
-                                    ["script", "style", "noscript"]
-                                ):
-                                    tag.decompose()
-
-                                raw_text = j_soup.get_text(
-                                    separator="\n", strip=True
-                                )
-                                lines = [
-                                    line.strip()
-                                    for line in raw_text.splitlines()
-                                    if line.strip()
-                                ]
-
-                                cleaned_lines = []
-                                title_pattern = re.compile(
-                                    rf"^(○)?{re.escape(rule_title)}$"
-                                )
-                                for line in lines:
-                                    if not title_pattern.match(line):
-                                        cleaned_lines.append(line)
-
-                                cleaned_text = "\n".join(cleaned_lines)
-                                hen_markdown += f"## {rule_title}\n\n{cleaned_text}\n\n---\n\n"
-
-                        out_zip.writestr(
-                            f"{hen_name}.md", hen_markdown.encode("utf-8")
-                        )
-
-                st.success("⚡ 全13編のベースMarkdown（ZIP）が生成されました！")
-                st.download_button(
-                    label="📥 ベースMarkdown (13編ZIP) をダウンロード",
-                    data=base_zip_buffer.getvalue(),
-                    file_name="reiki_13hen_base_markdowns.zip",
-                    mime="application/zip",
-                )
-
-st.markdown("---")
-
-# =========================================================
-# 【ステップ2】ステップ1のZIPを読み込み、1編ずつAI処理
-# =========================================================
-st.header("2️⃣ ステップ2: ベースZIPを読み込んでAIキーワード付与")
-st.caption(
-    "ステップ1でダウンロードした `reiki_13hen_base_markdowns.zip` をアップロードし、指定した編にAIキーワードを付与します。"
-)
-
-uploaded_base_zip = st.file_uploader(
-    "ステップ1で作成したベースZIPをアップロードしてください",
-    type=["zip"],
-    key="step2_uploader",
-)
-
-if uploaded_base_zip is not None:
-    base_zip_buffer = io.BytesIO(uploaded_base_zip.read())
-
-    with zipfile.ZipFile(base_zip_buffer, "r") as z:
-        md_files = [f for f in z.namelist() if f.endswith(".md")]
-
-        if md_files:
-            selected_md_file = st.selectbox(
-                "AIキーワードを処理・付与したい「編（ファイル）」を選択してください",
-                md_files,
-            )
-
-            # --- ステップ2の AIキーワード付与処理 ---
-            if st.button(
-                f"🤖 「{selected_md_file}」にAIキーワードを付与して保存"
+            # 処理ループ
+            for file_name, file_data in st.session_state.converted_files.items(
+                
             ):
-                content = z.read(selected_md_file).decode("utf-8")
+                text = file_data["content"]
+                sections = re.split(r"\n(?=##\s+)", text)
+                new_sections = []
 
-                # `---` (水平線) で各例規のブロックごとに分割する
-                blocks = content.split("\n---\n")
-
-                ai_enhanced_markdown = ""
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-                total_blocks = len(blocks)
-
-                for idx, block in enumerate(blocks):
-                    block_str = block.strip()
-                    if not block_str:
-                        continue
-
-                    progress_bar.progress((idx + 1) / total_blocks)
-
-                    # 最初（ファイルヘッダー # 01_第１編...）の処理
-                    if block_str.startswith("# "):
-                        ai_enhanced_markdown += block_str + "\n\n---\n\n"
-                        continue
-
-                    # ## 見出しからタイトルと本文を正しく抽出
-                    match = re.search(
-                        r"^##\s*(.*?)\n(.*)", block_str, re.DOTALL
-                    )
+                for section in sections:
+                    match = re.search(r"^##\s+(.+)$", section, re.MULTILINE)
                     if match:
                         rule_title = match.group(1).strip()
-                        rule_content = match.group(2).strip()
+                        processed_rules_count += 1
 
-                        status_text.text(
-                            f"AI解析中 ({idx + 1}/{total_blocks}): {rule_title}"
+                        # 時間計算
+                        elapsed = time.time() - start_time
+                        avg_time_per_item = (
+                            elapsed / processed_rules_count
+                            if processed_rules_count > 0
+                            else 4.5
+                        )
+                        remaining_items = (
+                            total_rules_count - processed_rules_count
+                        )
+                        remaining_seconds = remaining_items * avg_time_per_item
+
+                        rem_min = int(remaining_seconds // 60)
+                        rem_sec = int(remaining_seconds % 60)
+
+                        # 画面表示のリアルタイム更新
+                        status_area.markdown(
+                            f"**処理中 ({processed_rules_count}/{total_rules_count} 件):** `{file_name}` ➔ `## {rule_title}`"
+                        )
+                        time_area.markdown(
+                            f"⏱ 経過時間: **{int(elapsed)}秒** | 🏁 残り予想時間: **約 {rem_min}分 {rem_sec}秒**"
                         )
 
-                        # タイトルが存在する場合は Gemini に投げる
-                        if rule_title:
-                            #keywords = generate_keywords_with_gemini(
-                            #    rule_title, rule_content, gemini_api_key
-                            #)
-                            #time.sleep(12)  # 無料枠制限（5 RPM）回
-                            keywords = generate_keywords_with_ollama(
-                                rule_title, rule_content, model_name="qwen2.5:7b"
-                            )
-                        
-                        else:
-                            keywords = rule_title
+                        # API呼び出し
+                        summary = get_summary(rule_title, section)
+                        summary_tag = f"<!-- summary: {summary} -->\n"
+                        section = summary_tag + section
 
-                        # 正しい構造（キーワード ➔ ## タイトル ➔ 本文）で組み立て
-                        ai_enhanced_markdown += (
-                            f"<!-- 検索キーワード: {keywords} -->\n"
+                        # プログレスバー更新
+                        progress_bar.progress(
+                            processed_rules_count / total_rules_count
                         )
-                        ai_enhanced_markdown += (
-                            f"## {rule_title}\n{rule_content}\n\n---\n\n"
-                        )
-                    else:
-                        # マッチしない場合はそのまま保持
-                        ai_enhanced_markdown += block_str + "\n\n---\n\n"
 
-                st.success(
-                    f"🎉 「{selected_md_file}」のAIキーワード付与が完了しました！"
-                )
-                st.download_button(
-                    label=f"📥 {selected_md_file} (完成版) をダウンロード",
-                    data=ai_enhanced_markdown.encode("utf-8"),
-                    file_name=selected_md_file,
-                    mime="text/markdown",
-                )
+                    new_sections.append(section)
+
+                final_files[file_name] = "\n".join(new_sections)
+
+            st.success("🎉 すべての例規への要約付与が完了しました！")
+
+            # 完成Zipファイルの作成・ダウンロード
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, "w") as zf:
+                for fname, fcontent in final_files.items():
+                    zf.writestr(fname, fcontent.encode("utf-8"))
+
+            st.download_button(
+                label="📦 完成したナレッジZipファイルをダウンロード",
+                data=zip_buffer.getvalue(),
+                file_name="reiki_knowledge_summary_added.zip",
+                mime="application/zip",
+            )
