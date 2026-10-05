@@ -34,12 +34,30 @@ if "GEMINI_API_KEY" in st.secrets:
     api_key = st.secrets["GEMINI_API_KEY"]
 
 
-# --- 3. HTML ➔ シンプル Markdown 変換関数 ---
+# --- 3. DVD固有ルールに基づく例規判定 & Markdown変換関数 ---
+def is_reiki_file(filename: str) -> bool:
+    """DVDのファイル名パターンに基づく例規判定"""
+    base_name = os.path.basename(filename)
+
+    # 1. bunya_ で始まるファイル
+    if base_name.startswith("bunya_"):
+        return True
+
+    # 2. H で始まり _J.html (または _J.htm) で終わるファイル
+    base_lower = base_name.lower()
+    if base_name.startswith("H") and (
+        base_lower.endswith("_j.html") or base_lower.endswith("_j.htm")
+    ):
+        return True
+
+    return False
+
+
 def convert_html_to_markdown(html_content: str) -> tuple[str, str]:
-    """例規HTMLからタイトルと本文を抽出し、1つのMarkdownとして構築する"""
+    """例規HTMLからタイトルと本文を抽出し、Markdownを生成"""
     soup = BeautifulSoup(html_content, "html.parser")
 
-    # 不要なタグの除去
+    # 不要タグの除去
     for element in soup(["script", "style", "meta", "link"]):
         element.decompose()
 
@@ -81,16 +99,16 @@ uploaded_zip = st.file_uploader(
 if uploaded_zip:
     if st.button("⚙️ 第1段階: Markdown変換を実行"):
         stage1_output = {}
+        skipped_count = 0
 
         with zipfile.ZipFile(uploaded_zip, "r") as z:
             for zip_info in z.infolist():
-                # 本文HTML（例規本体）のみを対象とし、目次・検索・装飾用HTMLを除外
-                filename_lower = zip_info.filename.lower()
-                if (
-                    filename_lower.endswith((".html", ".htm"))
-                    and not zip_info.filename.startswith("__MACOSX")
-                    # 目次やシステム系ファイルが混ざっている場合はここで除外条件を追加可能
-                ):
+                # MACOSXの隠しファイルを除外
+                if zip_info.filename.startswith("__MACOSX"):
+                    continue
+
+                # DVDの例規ルール判定（bunya_... / H..._J.html）
+                if is_reiki_file(zip_info.filename):
                     with z.open(zip_info) as f:
                         content_bytes = f.read()
                         try:
@@ -114,16 +132,20 @@ if uploaded_zip:
                             "title": rule_title,
                             "content": md_text,
                         }
+                else:
+                    skipped_count += 1
 
         st.session_state.stage1_files = stage1_output
-        st.success("✅ 第1段階のMarkdown変換処理が完了しました！")
+        st.success(
+            f"✅ 第1段階のMarkdown変換処理が完了しました！（対象外のシステムファイル {skipped_count} 件を除外）"
+        )
 
 # 第1段階のデータが存在する場合のボリューム表示 & ダウンロードボタン
 if st.session_state.stage1_files:
     total_rules = len(st.session_state.stage1_files)
 
     col1, col2 = st.columns(2)
-    col1.metric("対象例規数（ファイル数）", f"{total_rules} 件")
+    col1.metric("対象例規数（抽出件数）", f"{total_rules} 件")
 
     # 無償API (1件約4.5秒待機) の場合の所要時間計算
     estimated_seconds = total_rules * 4.5
@@ -132,7 +154,7 @@ if st.session_state.stage1_files:
     col2.metric("第2段階の予想処理時間", f"約 {est_min}分 {est_sec}秒")
 
     st.info(
-        f"📊 ボリューム計測結果: **全 {total_rules} 件** の例規ファイルが処理対象です。"
+        f"📊 ボリューム計測結果: **全 {total_rules} 件** の例規ファイル（bunya_ / H..._J）が処理対象です。"
     )
 
     # 第1段階のMarkdown Zip作成 & ダウンロード
@@ -177,7 +199,6 @@ else:
         total_rules = len(st.session_state.stage1_files)
         final_files = {}
 
-        # 要約生成関数（新SDK呼び出し）
         def get_summary(title, text_content):
             prompt = f"""
 あなたは自治体例規の整理補助AIです。
@@ -195,19 +216,17 @@ else:
                     model="gemini-2.0-flash",
                     contents=prompt,
                 )
-                time.sleep(4.0)  # 無償枠のレート制限対策（1分間15回まで）
+                time.sleep(4.0)  # レート制限対策
                 return response.text.strip().replace("\n", " ")
             except Exception as e:
                 time.sleep(8.0)
                 return "概要の自動生成に失敗しました"
 
-        # 1ファイル（1例規）ごとに冒頭へ1つだけ要約を付与
         for fname, fdata in st.session_state.stage1_files.items():
             rule_title = fdata["title"]
             text_content = fdata["content"]
             processed_count += 1
 
-            # 時間・進捗計算
             elapsed = time.time() - start_time
             avg_time_per_item = (
                 elapsed / processed_count if processed_count > 0 else 4.5
@@ -218,7 +237,6 @@ else:
             rem_min = int(remaining_seconds // 60)
             rem_sec = int(remaining_seconds % 60)
 
-            # 画面表示のリアルタイム更新
             status_area.markdown(
                 f"**処理中 ({processed_count}/{total_rules} 件):** `{fname}` ➔ `{rule_title}`"
             )
@@ -226,19 +244,15 @@ else:
                 f"⏱ 経過時間: **{int(elapsed)}秒** | 🏁 残り予想時間: **約 {rem_min}分 {rem_sec}秒**"
             )
 
-            # API呼び出しで要約を取得し、ファイルの先頭に1つだけ挿入
             summary = get_summary(rule_title, text_content)
             summary_tag = f"<!-- summary: {summary} -->\n"
             final_md_content = summary_tag + text_content
 
             final_files[fname] = final_md_content
-
-            # プログレスバー更新
             progress_bar.progress(processed_count / total_rules)
 
         st.success("🎉 すべての例規への要約付与が完了しました！")
 
-        # 第2段階の完成Zipファイルの作成・ダウンロード
         zip_buffer_stage2 = io.BytesIO()
         with zipfile.ZipFile(zip_buffer_stage2, "w") as zf:
             for fname, fcontent in final_files.items():
