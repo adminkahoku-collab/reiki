@@ -3,6 +3,7 @@ import os
 import re
 import time
 import zipfile
+from bs4 import BeautifulSoup
 from google import genai
 import streamlit as st
 
@@ -27,91 +28,171 @@ if not st.session_state.authenticated:
     st.stop()
 
 
-# --- 2. メイン画面 ---
+# --- 2. API Key の取得（st.secrets より取得） ---
+api_key = None
+if "GEMINI_API_KEY" in st.secrets:
+    api_key = st.secrets["GEMINI_API_KEY"]
+
+
+# --- 3. HTML ➔ シンプル Markdown 変換関数 ---
+def convert_html_to_markdown(html_content: str) -> str:
+    """例規HTMLからタイトルと本文を抽出し、##見出しの標準Markdownへ変換"""
+    soup = BeautifulSoup(html_content, "html.parser")
+
+    # タグや余分な装飾の除去・抽出処理（例規用）
+    # タイトル取得（h1, h2, title等から抽出）
+    title_tag = soup.find(["h1", "h2", "title"])
+    title = title_tag.get_text(strip=True) if title_tag else "無題の例規"
+
+    # 本文テキスト取得
+    for element in soup(["script", "style", "meta", "link"]):
+        element.decompose()
+
+    text = soup.get_text(separator="\n")
+    # 余分な空行を整理
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    body_text = "\n".join(lines)
+
+    # Markdown構築
+    md_content = f"## {title}\n\n{body_text}\n"
+    return md_content
+
+
+# --- 4. メイン画面 ---
 st.title("📄 例規データ ナレッジ化処理システム")
 st.caption(
-    "第1段階: Markdown変換 & ボリューム確認 ➔ 第2段階: 無償API要約付与"
+    "第1段階: DVD Zip(HTML) ➔ 標準MD化 & ボリューム計測 ➔ 第2段階: Gemini要約付与"
 )
-
-# サイドバー設定
-st.sidebar.header("設定")
-api_key = st.sidebar.text_input("Gemini API Key (Free Tier)", type="password")
 
 # セッション状態の初期化
-if "converted_files" not in st.session_state:
-    st.session_state.converted_files = {}
+if "stage1_files" not in st.session_state:
+    st.session_state.stage1_files = {}
 
 
-# --- 第1段階：Markdown化とボリューム把握 ---
-st.header("【第1段階】Markdownファイルの読み込みとボリューム確認")
+# ==============================================================================
+# 【第1段階】DVD Zip (HTML等) ➔ 標準 Markdown 変換 & ダウンロード & ボリューム計測
+# ==============================================================================
+st.header("【第1段階】DVD Zipファイルの読み込み・Markdown変換・ボリューム確認")
 
-uploaded_files = st.file_uploader(
-    "1段階目の標準Markdownファイル（複数可）を選択してください",
-    type=["md"],
-    accept_multiple_files=True,
+uploaded_zip = st.file_uploader(
+    "DVDデータがまとまった Zip ファイルを選択してください",
+    type=["zip"],
 )
 
-if uploaded_files:
-    total_rules_count = 0
-    file_rule_mapping = {}
+if uploaded_zip:
+    if st.button("⚙️ 第1段階: Markdown変換を実行"):
+        stage1_output = {}
+        total_rules_count = 0
 
-    # ボリュームの解析
-    for uploaded_file in uploaded_files:
-        content = uploaded_file.read().decode("utf-8")
-        uploaded_file.seek(0)  # ポインタを戻す
+        with zipfile.ZipFile(uploaded_zip, "r") as z:
+            for zip_info in z.infolist():
+                # HTMLファイルを対象（隠しファイルやフォルダ等を除外）
+                if zip_info.filename.endswith(
+                    (".html", ".htm")
+                ) and not zip_info.filename.startswith("__MACOSX"):
+                    with z.open(zip_info) as f:
+                        # 文字コード対応（cp932/shift_jis/utf-8）
+                        content_bytes = f.read()
+                        try:
+                            html_text = content_bytes.decode("cp932")
+                        except UnicodeDecodeError:
+                            html_text = content_bytes.decode(
+                                "utf-8", errors="ignore"
+                            )
 
-        # '## ' の見出し数をカウント（条例数）
-        rules = re.findall(r"^##\s+(.+)$", content, re.MULTILINE)
-        rule_count = len(rules)
+                        # Markdownへ変換
+                        md_text = convert_html_to_markdown(html_text)
+                        # 出力ファイル名 (.html -> .md)
+                        md_filename = (
+                            os.path.basename(zip_info.filename).rsplit(".", 1)[
+                                0
+                            ]
+                            + ".md"
+                        )
 
-        file_rule_mapping[uploaded_file.name] = {
-            "content": content,
-            "rule_count": rule_count,
-        }
-        total_rules_count += rule_count
+                        # '## ' 見出し数（条例数）のカウント
+                        rules = re.findall(
+                            r"^##\s+(.+)$", md_text, re.MULTILINE
+                        )
+                        rule_count = len(rules)
 
-    st.session_state.converted_files = file_rule_mapping
+                        stage1_output[md_filename] = {
+                            "content": md_text,
+                            "rule_count": rule_count,
+                        }
+                        total_rules_count += rule_count
 
-    # ボリューム情報の表示
+        st.session_state.stage1_files = stage1_output
+        st.success("✅ 第1段階のMarkdown変換処理が完了しました！")
+
+# 第1段階のデータが存在する場合のボリューム表示 & ダウンロードボタン
+if st.session_state.stage1_files:
+    file_count = len(st.session_state.stage1_files)
+    total_rules = sum(
+        v["rule_count"] for v in st.session_state.stage1_files.values()
+    )
+
     col1, col2, col3 = st.columns(3)
-    col1.metric("総ファイル数", f"{len(uploaded_files)} 件")
-    col2.metric("総条例（##）数", f"{total_rules_count} 件")
+    col1.metric("総ファイル数", f"{file_count} 件")
+    col2.metric("総条例（##）数", f"{total_rules} 件")
 
-    # 無償API (15 RPM -> 1件約4.5秒待機) の場合の所要時間計算
-    estimated_seconds = total_rules_count * 4.5
+    # 無償API (1件約4.5秒待機) の場合の所要時間計算
+    estimated_seconds = total_rules * 4.5
     est_min = int(estimated_seconds // 60)
     est_sec = int(estimated_seconds % 60)
     col3.metric("第2段階の予想処理時間", f"約 {est_min}分 {est_sec}秒")
 
     st.info(
-        f"💡 ボリューム確認完了: 合計 **{total_rules_count} 件** の条例が見つかりました。第2段階の処理を開始できます。"
+        f"📊 ボリューム計測結果: **全 {total_rules} 件** の条文（`##`）が見つかりました。"
     )
 
-    st.divider()
+    # 第1段階のMarkdown Zip作成 & ダウンロード
+    zip_buffer_stage1 = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer_stage1, "w") as zf:
+        for fname, fdata in st.session_state.stage1_files.items():
+            zf.writestr(fname, fdata["content"].encode("utf-8"))
 
-    # --- 第2段階：無償APIによる要約付与処理 ---
-    st.header("【第2段階】要約・タグの自動付与（Gemini API）")
+    st.download_button(
+        label="📥 第1段階: 変換済み標準Markdown Zipをダウンロード",
+        data=zip_buffer_stage1.getvalue(),
+        file_name="reiki_standard_markdown.zip",
+        mime="application/zip",
+    )
 
-    if not api_key:
-        st.warning(
-            "⚠️ 第2段階を進めるには、サイドバーに Gemini API Key を入力してください。"
+st.divider()
+
+
+# ==============================================================================
+# 【第2段階】無償API（Gemini）による要約・タグの自動付与
+# ==============================================================================
+st.header("【第2段階】要約・タグの自動付与（Gemini API）")
+
+if not st.session_state.stage1_files:
+    st.warning(
+        "⚠️ 先に【第1段階】の変換処理を実行してデータを生成してください。"
+    )
+elif not api_key:
+    st.error(
+        "❌ Streamlit Secrets に `GEMINI_API_KEY` が設定されていません。Settings > Secrets を確認してください。"
+    )
+else:
+    client = genai.Client(api_key=api_key)
+
+    if st.button("🚀 第2段階: 要約の自動付与を開始する"):
+        progress_bar = st.progress(0)
+        status_area = st.empty()
+        time_area = st.empty()
+
+        start_time = time.time()
+        processed_rules_count = 0
+        total_rules_count = sum(
+            v["rule_count"] for v in st.session_state.stage1_files.values()
         )
-    else:
-        # 新SDKのクライアント初期化
-        client = genai.Client(api_key=api_key)
+        final_files = {}
 
-        if st.button("🚀 要約の自動付与を開始する"):
-            progress_bar = st.progress(0)
-            status_area = st.empty()
-            time_area = st.empty()
-
-            start_time = time.time()
-            processed_rules_count = 0
-            final_files = {}
-
-            # 要約生成関数（新SDK呼び出しに対応）
-            def get_summary(title, text_content):
-                prompt = f"""
+        # 要約生成関数（新SDK呼び出し）
+        def get_summary(title, text_content):
+            prompt = f"""
 あなたは自治体例規の整理補助AIです。
 以下の例規の「タイトル」と「本文」を読み、概要とカテゴリを以下のフォーマットで短く出力してください。
 
@@ -122,81 +203,75 @@ if uploaded_files:
 【出力フォーマット】
 概要：[1〜2文で何について定めたものか] / 対象カテゴリ：[関連する検索単語や分野をカンマ区切りで3〜5個]
 """
-                try:
-                    # 新SDKのAPI呼び出し方法
-                    response = client.models.generate_content(
-                        model="gemini-2.0-flash",
-                        contents=prompt,
+            try:
+                response = client.models.generate_content(
+                    model="gemini-2.0-flash",
+                    contents=prompt,
+                )
+                time.sleep(4.0)  # 無償枠のレート制限対策（1分間15回まで）
+                return response.text.strip().replace("\n", " ")
+            except Exception as e:
+                time.sleep(8.0)
+                return "概要の自動生成に失敗しました"
+
+        # 処理ループ
+        for fname, fdata in st.session_state.stage1_files.items():
+            text = fdata["content"]
+            sections = re.split(r"\n(?=##\s+)", text)
+            new_sections = []
+
+            for section in sections:
+                match = re.search(r"^##\s+(.+)$", section, re.MULTILINE)
+                if match:
+                    rule_title = match.group(1).strip()
+                    processed_rules_count += 1
+
+                    # 時間・進捗計算
+                    elapsed = time.time() - start_time
+                    avg_time_per_item = (
+                        elapsed / processed_rules_count
+                        if processed_rules_count > 0
+                        else 4.5
                     )
-                    time.sleep(4.0)  # 無償枠のレート制限対策（1分間15回まで）
-                    return response.text.strip().replace("\n", " ")
-                except Exception as e:
-                    time.sleep(8.0)
-                    return "概要の自動生成に失敗しました"
+                    remaining_items = total_rules_count - processed_rules_count
+                    remaining_seconds = remaining_items * avg_time_per_item
 
-            # 処理ループ
-            for (
-                file_name,
-                file_data,
-            ) in st.session_state.converted_files.items():
-                text = file_data["content"]
-                sections = re.split(r"\n(?=##\s+)", text)
-                new_sections = []
+                    rem_min = int(remaining_seconds // 60)
+                    rem_sec = int(remaining_seconds % 60)
 
-                for section in sections:
-                    match = re.search(r"^##\s+(.+)$", section, re.MULTILINE)
-                    if match:
-                        rule_title = match.group(1).strip()
-                        processed_rules_count += 1
+                    # 画面表示のリアルタイム更新
+                    status_area.markdown(
+                        f"**処理中 ({processed_rules_count}/{total_rules_count} 件):** `{fname}` ➔ `## {rule_title}`"
+                    )
+                    time_area.markdown(
+                        f"⏱ 経過時間: **{int(elapsed)}秒** | 🏁 残り予想時間: **約 {rem_min}分 {rem_sec}秒**"
+                    )
 
-                        # 時間計算
-                        elapsed = time.time() - start_time
-                        avg_time_per_item = (
-                            elapsed / processed_rules_count
-                            if processed_rules_count > 0
-                            else 4.5
-                        )
-                        remaining_items = (
-                            total_rules_count - processed_rules_count
-                        )
-                        remaining_seconds = remaining_items * avg_time_per_item
+                    # API呼び出し
+                    summary = get_summary(rule_title, section)
+                    summary_tag = f"<!-- summary: {summary} -->\n"
+                    section = summary_tag + section
 
-                        rem_min = int(remaining_seconds // 60)
-                        rem_sec = int(remaining_seconds % 60)
+                    # プログレスバー更新
+                    progress_bar.progress(
+                        processed_rules_count / total_rules_count
+                    )
 
-                        # 画面表示のリアルタイム更新
-                        status_area.markdown(
-                            f"**処理中 ({processed_rules_count}/{total_rules_count} 件):** `{file_name}` ➔ `## {rule_title}`"
-                        )
-                        time_area.markdown(
-                            f"⏱ 経過時間: **{int(elapsed)}秒** | 🏁 残り予想時間: **約 {rem_min}分 {rem_sec}秒**"
-                        )
+                new_sections.append(section)
 
-                        # API呼び出し
-                        summary = get_summary(rule_title, section)
-                        summary_tag = f"<!-- summary: {summary} -->\n"
-                        section = summary_tag + section
+            final_files[fname] = "\n".join(new_sections)
 
-                        # プログレスバー更新
-                        progress_bar.progress(
-                            processed_rules_count / total_rules_count
-                        )
+        st.success("🎉 すべての例規への要約付与が完了しました！")
 
-                    new_sections.append(section)
+        # 第2段階の完成Zipファイルの作成・ダウンロード
+        zip_buffer_stage2 = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer_stage2, "w") as zf:
+            for fname, fcontent in final_files.items():
+                zf.writestr(fname, fcontent.encode("utf-8"))
 
-                final_files[file_name] = "\n".join(new_sections)
-
-            st.success("🎉 すべての例規への要約付与が完了しました！")
-
-            # 完成Zipファイルの作成・ダウンロード
-            zip_buffer = io.BytesIO()
-            with zipfile.ZipFile(zip_buffer, "w") as zf:
-                for fname, fcontent in final_files.items():
-                    zf.writestr(fname, fcontent.encode("utf-8"))
-
-            st.download_button(
-                label="📦 完成したナレッジZipファイルをダウンロード",
-                data=zip_buffer.getvalue(),
-                file_name="reiki_knowledge_summary_added.zip",
-                mime="application/zip",
-            )
+        st.download_button(
+            label="📦 第2段階: 完成したナレッジZipファイルをダウンロード",
+            data=zip_buffer_stage2.getvalue(),
+            file_name="reiki_knowledge_summary_added.zip",
+            mime="application/zip",
+        )
