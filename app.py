@@ -3,13 +3,11 @@ import os
 import re
 import time
 import zipfile
-import google.generativeai as genai
+from google import genai
 import streamlit as st
 
 # --- ページ設定 ---
-st.set_page_config(
-    page_title="例規ナレッジ化処理ツール", layout="wide"
-)
+st.set_page_config(page_title="例規ナレッジ化処理ツール", layout="wide")
 
 # --- 1. パスワード認証機能 ---
 PASSWORD = "reiki063215"
@@ -31,13 +29,13 @@ if not st.session_state.authenticated:
 
 # --- 2. メイン画面 ---
 st.title("📄 例規データ ナレッジ化処理システム")
-st.caption("第1段階: Markdown変換 & ボリューム確認 ➔ 第2段階: 無償API要約付与")
+st.caption(
+    "第1段階: Markdown変換 & ボリューム確認 ➔ 第2段階: 無償API要約付与"
+)
 
 # サイドバー設定
 st.sidebar.header("設定")
-api_key = st.sidebar.text_input(
-    "Gemini API Key (Free Tier)", type="password"
-)
+api_key = st.sidebar.text_input("Gemini API Key (Free Tier)", type="password")
 
 # セッション状態の初期化
 if "converted_files" not in st.session_state:
@@ -99,8 +97,8 @@ if uploaded_files:
             "⚠️ 第2段階を進めるには、サイドバーに Gemini API Key を入力してください。"
         )
     else:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-3.6-flash")
+        # 新SDKのクライアント初期化
+        client = genai.Client(api_key=api_key)
 
         if st.button("🚀 要約の自動付与を開始する"):
             progress_bar = st.progress(0)
@@ -111,7 +109,7 @@ if uploaded_files:
             processed_rules_count = 0
             final_files = {}
 
-            # 要約生成関数
+            # 要約生成関数（新SDK呼び出しに対応）
             def get_summary(title, text_content):
                 prompt = f"""
 あなたは自治体例規の整理補助AIです。
@@ -125,17 +123,22 @@ if uploaded_files:
 概要：[1〜2文で何について定めたものか] / 対象カテゴリ：[関連する検索単語や分野をカンマ区切りで3〜5個]
 """
                 try:
-                    res = model.generate_content(prompt)
+                    # 新SDKのAPI呼び出し方法
+                    response = client.models.generate_content(
+                        model="gemini-2.0-flash",
+                        contents=prompt,
+                    )
                     time.sleep(4.0)  # 無償枠のレート制限対策（1分間15回まで）
-                    return res.text.strip().replace("\n", " ")
+                    return response.text.strip().replace("\n", " ")
                 except Exception as e:
                     time.sleep(8.0)
                     return "概要の自動生成に失敗しました"
 
             # 処理ループ
-            for file_name, file_data in st.session_state.converted_files.items(
-                
-            ):
+            for (
+                file_name,
+                file_data,
+            ) in st.session_state.converted_files.items():
                 text = file_data["content"]
                 sections = re.split(r"\n(?=##\s+)", text)
                 new_sections = []
