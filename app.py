@@ -65,6 +65,9 @@ def generate_keywords_with_gemini(
 def generate_keywords_with_ollama(
     title: str, content: str, model_name: str = "qwen2.5:7b"
 ) -> str:
+    # ★ Pythonプロセス全体でローカル通信のプロキシ利用を無効化（追加）
+    os.environ["NO_PROXY"] = "127.0.0.1,localhost"
+    os.environ["no_proxy"] = "127.0.0.1,localhost"
     prompt = f"""
 あなたは自治体例規集のインデックス作成アシスタントです。
 以下の例規の「タイトル」と「本文」を読み、検索用の補完キーワード（単語）を抽出してください。
