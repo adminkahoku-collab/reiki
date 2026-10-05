@@ -5,6 +5,8 @@ import zipfile
 from bs4 import BeautifulSoup
 from google import genai
 import streamlit as st
+import json
+import urllib.request
 
 st.set_page_config(
     page_title="例規13編自動分割＆AIキーワード付与ツール",
@@ -59,6 +61,55 @@ def generate_keywords_with_gemini(
                 break
     return f"{title}"
 
+# --- Ollama (qwen2.5:7b) によるキーワード生成関数 ---
+def generate_keywords_with_ollama(
+    title: str, content: str, model_name: str = "qwen2.5:7b"
+) -> str:
+    prompt = f"""
+あなたは自治体例規集のインデックス作成アシスタントです。
+以下の例規の「タイトル」と「本文」を読み、検索用の補完キーワード（単語）を抽出してください。
+
+【厳格な出力条件】
+1. 例規名（{title}）に含まれていない同義語、類義語、関連する実務用語・対象分野のみを抽出してください。
+2. 例規名そのもの（「{title}」）や、「条例」「規則」「規程」「に関する」などの形式単語は【絶対に含めないでください】。
+3. 半角スペース区切りの単語列のみを1行で出力してください。
+4. 例: 「休日 執務時間 閉庁日 年末年始」
+
+【対象例規】
+タイトル: {title}
+本文冒頭: {content[:1000]}
+"""
+
+    url = "http://localhost:11434/api/generate"
+    payload = {
+        "model": model_name,
+        "prompt": prompt,
+        "stream": False,
+    }
+
+    try:
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        # CPU推論用にタイムアウトを180秒に設定
+        with urllib.request.urlopen(req, timeout=180) as res:
+            result = json.loads(res.read().decode("utf-8"))
+            keywords = result.get("response", "").strip()
+
+            keywords = (
+                keywords.replace("\n", " ")
+                .replace("、", " ")
+                .replace(",", " ")
+                .replace("<!--", "")
+                .replace("-->", "")
+            )
+            return keywords
+    except Exception as e:
+        st.error(f"Ollama処理エラー ({title}): {e}")
+        return ""
 
 # =========================================================
 # 【ステップ1】HTMLから全13編のベースMarkdown(ZIP)を一括作成
@@ -286,10 +337,14 @@ if uploaded_base_zip is not None:
 
                         # タイトルが存在する場合は Gemini に投げる
                         if rule_title:
-                            keywords = generate_keywords_with_gemini(
-                                rule_title, rule_content, gemini_api_key
+                            #keywords = generate_keywords_with_gemini(
+                            #    rule_title, rule_content, gemini_api_key
+                            #)
+                            #time.sleep(12)  # 無料枠制限（5 RPM）回
+                            keywords = generate_keywords_with_ollama(
+                                rule_title, rule_content, model_name="qwen2.5:7b"
                             )
-                            time.sleep(12)  # 無料枠制限（5 RPM）回避
+                        
                         else:
                             keywords = rule_title
 
