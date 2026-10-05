@@ -1,6 +1,5 @@
 import io
 import os
-import re
 import time
 import zipfile
 from bs4 import BeautifulSoup
@@ -54,14 +53,14 @@ def is_reiki_file(filename: str) -> bool:
 
 
 def convert_html_to_markdown(html_content: str) -> tuple[str, str]:
-    """例規HTMLからタイトルと本文を抽出し、Markdownを生成"""
+    """例規HTMLからタイトルと本文を抽出し、標準Markdownを生成"""
     soup = BeautifulSoup(html_content, "html.parser")
 
     # 不要タグの除去
     for element in soup(["script", "style", "meta", "link"]):
         element.decompose()
 
-    # タイトルの取得（h1, h2, titleタグ等から優先取得）
+    # タイトルの取得
     title_tag = soup.find(["h1", "h2", "title"])
     title = title_tag.get_text(strip=True) if title_tag else "無題の例規"
 
@@ -70,7 +69,7 @@ def convert_html_to_markdown(html_content: str) -> tuple[str, str]:
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     body_text = "\n".join(lines)
 
-    # 先頭に##の見出しを1つだけ付けたMarkdownを生成
+    # 見出し付きMarkdown生成
     md_content = f"## {title}\n\n{body_text}\n"
     return title, md_content
 
@@ -78,7 +77,7 @@ def convert_html_to_markdown(html_content: str) -> tuple[str, str]:
 # --- 4. メイン画面 ---
 st.title("📄 例規データ ナレッジ化処理システム")
 st.caption(
-    "第1段階: DVD Zip(HTML) ➔ 標準MD化 & ボリューム計測 ➔ 第2段階: Gemini要約付与"
+    "第1段階: DVD Zip(HTML) ➔ 標準MD化 & ボリューム計測 ➔ 第2段階: MDベースでGemini要約付与"
 )
 
 # セッション状態の初期化
@@ -103,11 +102,9 @@ if uploaded_zip:
 
         with zipfile.ZipFile(uploaded_zip, "r") as z:
             for zip_info in z.infolist():
-                # MACOSXの隠しファイルを除外
                 if zip_info.filename.startswith("__MACOSX"):
                     continue
 
-                # DVDの例規ルール判定（bunya_... / H..._J.html）
                 if is_reiki_file(zip_info.filename):
                     with z.open(zip_info) as f:
                         content_bytes = f.read()
@@ -128,6 +125,7 @@ if uploaded_zip:
                             + ".md"
                         )
 
+                        # 第1段階の成果物（MD本文）をメモリ上に保存
                         stage1_output[md_filename] = {
                             "title": rule_title,
                             "content": md_text,
@@ -147,14 +145,13 @@ if st.session_state.stage1_files:
     col1, col2 = st.columns(2)
     col1.metric("対象例規数（抽出件数）", f"{total_rules} 件")
 
-    # 無償API (1件約4.5秒待機) の場合の所要時間計算
     estimated_seconds = total_rules * 4.5
     est_min = int(estimated_seconds // 60)
     est_sec = int(estimated_seconds % 60)
     col2.metric("第2段階の予想処理時間", f"約 {est_min}分 {est_sec}秒")
 
     st.info(
-        f"📊 ボリューム計測結果: **全 {total_rules} 件** の例規ファイル（bunya_ / H..._J）が処理対象です。"
+        f"📊 ボリューム計測結果: **全 {total_rules} 件** のMarkdown化データが第2段階の入力ベースとなります。"
     )
 
     # 第1段階のMarkdown Zip作成 & ダウンロード
@@ -174,9 +171,9 @@ st.divider()
 
 
 # ==============================================================================
-# 【第2段階】無償API（Gemini）による要約・タグの自動付与
+# 【第2段階】第1段階のMarkdownデータをベースにした要約・タグ自動付与
 # ==============================================================================
-st.header("【第2段階】要約・タグの自動付与（Gemini API）")
+st.header("【第2段階】Markdownベースでの要約・タグの自動付与（Gemini API）")
 
 if not st.session_state.stage1_files:
     st.warning(
@@ -199,14 +196,14 @@ else:
         total_rules = len(st.session_state.stage1_files)
         final_files = {}
 
-        def get_summary(title, text_content):
+        def get_summary_from_md(md_content):
+            """第1段階で生成したMarkdown本文をそのまま渡して要約を取得"""
             prompt = f"""
 あなたは自治体例規の整理補助AIです。
-以下の例規の「タイトル」と「本文」を読み、概要とカテゴリを以下のフォーマットで短く出力してください。
+以下の例規Markdownデータを読み、概要とカテゴリを以下のフォーマットで短く出力してください。
 
-【対象例規】
-タイトル: {title}
-本文冒頭: {text_content[:1000]}
+【対象例規Markdown】
+{md_content[:1500]}
 
 【出力フォーマット】
 概要：[1〜2文で何について定めたものか] / 対象カテゴリ：[関連する検索単語や分野をカンマ区切りで3〜5個]
@@ -222,11 +219,13 @@ else:
                 time.sleep(8.0)
                 return "概要の自動生成に失敗しました"
 
+        # 第1段階で作成したMDデータを順次処理
         for fname, fdata in st.session_state.stage1_files.items():
             rule_title = fdata["title"]
-            text_content = fdata["content"]
+            md_text = fdata["content"]  # 第1段階のMDデータ
             processed_count += 1
 
+            # 残り時間計算
             elapsed = time.time() - start_time
             avg_time_per_item = (
                 elapsed / processed_count if processed_count > 0 else 4.5
@@ -238,21 +237,23 @@ else:
             rem_sec = int(remaining_seconds % 60)
 
             status_area.markdown(
-                f"**処理中 ({processed_count}/{total_rules} 件):** `{fname}` ➔ `{rule_title}`"
+                f"**処理中 ({processed_count}/{total_rules} 件):** `{fname}` （{rule_title}）"
             )
             time_area.markdown(
                 f"⏱ 経過時間: **{int(elapsed)}秒** | 🏁 残り予想時間: **約 {rem_min}分 {rem_sec}秒**"
             )
 
-            summary = get_summary(rule_title, text_content)
+            # 第1段階のMDから要約文を生成
+            summary = get_summary_from_md(md_text)
             summary_tag = f"<!-- summary: {summary} -->\n"
-            final_md_content = summary_tag + text_content
 
-            final_files[fname] = final_md_content
+            # 第1段階のMDテキストの「先頭」に要約タグをそのまま結合
+            final_files[fname] = summary_tag + md_text
             progress_bar.progress(processed_count / total_rules)
 
-        st.success("🎉 すべての例規への要約付与が完了しました！")
+        st.success("🎉 すべてのMarkdownファイルへの要約付与が完了しました！")
 
+        # 最終完成版のZipファイル作成
         zip_buffer_stage2 = io.BytesIO()
         with zipfile.ZipFile(zip_buffer_stage2, "w") as zf:
             for fname, fcontent in final_files.items():
