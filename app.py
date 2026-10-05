@@ -18,11 +18,11 @@ password = st.sidebar.text_input("職員用パスワード", type="password")
 # --- Streamlit Secrets から Gemini API キーを取得 ---
 gemini_api_key = st.secrets.get("GEMINI_API_KEY", "")
 
-# --- Geminiによる例規ごとの要約生成関数（リトライ＆ウェイト対応） ---
+# --- Geminiによる例規ごとの要約生成関数（モデル自動切り替え＆無料枠対応） ---
 def generate_summary_with_gemini(
     title: str, content: str, api_key: str
 ) -> str:
-  """Gemini を使用して例規ごとの要約を生成（レート制限対策付き）"""
+  """無料枠（RPM 15 / RPD 1500）のモデルを利用して要約を生成"""
   if not api_key:
     return "（APIキー未設定のため要約スキップ）"
 
@@ -42,32 +42,50 @@ def generate_summary_with_gemini(
 
   client = genai.Client(api_key=api_key)
 
-  # 429エラーが発生した際のリトライ処理（最大3回まで試行）
-  max_retries = 3
-  for attempt in range(max_retries):
+  # 利用を試みるモデルの優先順リスト（404エラー対策）
+  candidate_models = [
+      "gemini-1.5-flash",
+      "gemini-2.0-flash",
+      "gemini-3.8-flash",
+  ]
+
+  for model_name in candidate_models:
     try:
       response = client.models.generate_content(
-          model="gemini-2.5-flash",
+          model=model_name,
           contents=prompt,
       )
 
-      # 無料枠の制限（1分5回）を考慮し、成功後も12秒間ウェイトを置く
-      time.sleep(12)
+      # 1分15回制限（RPM 15）対策：1回成功ごとに4.5秒待機
+      time.sleep(4.5)
       return response.text.strip()
 
     except Exception as e:
-      if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
-        if attempt < max_retries - 1:
-          wait_time = 25  # エラーメッセージの指示通り25秒待機して再試行
-          st.warning(
-              f"API制限に達したため、{wait_time}秒待機して再試行します... ({title})"
-          )
-          time.sleep(wait_time)
-          continue
-      st.warning(f"Gemini API（要約生成）でエラー ({title}): {e}")
-      return "（要約生成エラー）"
+      err_str = str(e)
+      # 404（モデルが存在しない・廃止）の場合は次の候補モデルへ移行
+      if "404" in err_str or "NOT_FOUND" in err_str:
+        continue
 
-  return "（要約生成エラー：リトライ上限到達）"
+      # 429（レート制限）の場合は待機して再試行
+      if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+        st.warning(f"レート制限検知。15秒待機して再試行します... ({title})")
+        time.sleep(15)
+        try:
+          response = client.models.generate_content(
+              model=model_name,
+              contents=prompt,
+          )
+          time.sleep(4.5)
+          return response.text.strip()
+        except Exception:
+          pass
+
+      st.warning(
+          f"Gemini APIエラー ({model_name} / {title}): {e}"
+      )
+      break
+
+  return "（要約生成エラー：有効なモデルが見つかりません）"
 
 
 # --- メイン処理 ---
