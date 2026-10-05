@@ -35,27 +35,26 @@ if "GEMINI_API_KEY" in st.secrets:
 
 
 # --- 3. HTML ➔ シンプル Markdown 変換関数 ---
-def convert_html_to_markdown(html_content: str) -> str:
-    """例規HTMLからタイトルと本文を抽出し、##見出しの標準Markdownへ変換"""
+def convert_html_to_markdown(html_content: str) -> tuple[str, str]:
+    """例規HTMLからタイトルと本文を抽出し、1つのMarkdownとして構築する"""
     soup = BeautifulSoup(html_content, "html.parser")
 
-    # タグや余分な装飾の除去・抽出処理（例規用）
-    # タイトル取得（h1, h2, title等から抽出）
-    title_tag = soup.find(["h1", "h2", "title"])
-    title = title_tag.get_text(strip=True) if title_tag else "無題の例規"
-
-    # 本文テキスト取得
+    # 不要なタグの除去
     for element in soup(["script", "style", "meta", "link"]):
         element.decompose()
 
+    # タイトルの取得（h1, h2, titleタグ等から優先取得）
+    title_tag = soup.find(["h1", "h2", "title"])
+    title = title_tag.get_text(strip=True) if title_tag else "無題の例規"
+
+    # 本文テキストの取得
     text = soup.get_text(separator="\n")
-    # 余分な空行を整理
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     body_text = "\n".join(lines)
 
-    # Markdown構築
+    # 先頭に##の見出しを1つだけ付けたMarkdownを生成
     md_content = f"## {title}\n\n{body_text}\n"
-    return md_content
+    return title, md_content
 
 
 # --- 4. メイン画面 ---
@@ -82,16 +81,17 @@ uploaded_zip = st.file_uploader(
 if uploaded_zip:
     if st.button("⚙️ 第1段階: Markdown変換を実行"):
         stage1_output = {}
-        total_rules_count = 0
 
         with zipfile.ZipFile(uploaded_zip, "r") as z:
             for zip_info in z.infolist():
-                # HTMLファイルを対象（隠しファイルやフォルダ等を除外）
-                if zip_info.filename.endswith(
-                    (".html", ".htm")
-                ) and not zip_info.filename.startswith("__MACOSX"):
+                # 本文HTML（例規本体）のみを対象とし、目次・検索・装飾用HTMLを除外
+                filename_lower = zip_info.filename.lower()
+                if (
+                    filename_lower.endswith((".html", ".htm"))
+                    and not zip_info.filename.startswith("__MACOSX")
+                    # 目次やシステム系ファイルが混ざっている場合はここで除外条件を追加可能
+                ):
                     with z.open(zip_info) as f:
-                        # 文字コード対応（cp932/shift_jis/utf-8）
                         content_bytes = f.read()
                         try:
                             html_text = content_bytes.decode("cp932")
@@ -100,9 +100,9 @@ if uploaded_zip:
                                 "utf-8", errors="ignore"
                             )
 
-                        # Markdownへ変換
-                        md_text = convert_html_to_markdown(html_text)
-                        # 出力ファイル名 (.html -> .md)
+                        rule_title, md_text = convert_html_to_markdown(
+                            html_text
+                        )
                         md_filename = (
                             os.path.basename(zip_info.filename).rsplit(".", 1)[
                                 0
@@ -110,40 +110,29 @@ if uploaded_zip:
                             + ".md"
                         )
 
-                        # '## ' 見出し数（条例数）のカウント
-                        rules = re.findall(
-                            r"^##\s+(.+)$", md_text, re.MULTILINE
-                        )
-                        rule_count = len(rules)
-
                         stage1_output[md_filename] = {
+                            "title": rule_title,
                             "content": md_text,
-                            "rule_count": rule_count,
                         }
-                        total_rules_count += rule_count
 
         st.session_state.stage1_files = stage1_output
         st.success("✅ 第1段階のMarkdown変換処理が完了しました！")
 
 # 第1段階のデータが存在する場合のボリューム表示 & ダウンロードボタン
 if st.session_state.stage1_files:
-    file_count = len(st.session_state.stage1_files)
-    total_rules = sum(
-        v["rule_count"] for v in st.session_state.stage1_files.values()
-    )
+    total_rules = len(st.session_state.stage1_files)
 
-    col1, col2, col3 = st.columns(3)
-    col1.metric("総ファイル数", f"{file_count} 件")
-    col2.metric("総条例（##）数", f"{total_rules} 件")
+    col1, col2 = st.columns(2)
+    col1.metric("対象例規数（ファイル数）", f"{total_rules} 件")
 
     # 無償API (1件約4.5秒待機) の場合の所要時間計算
     estimated_seconds = total_rules * 4.5
     est_min = int(estimated_seconds // 60)
     est_sec = int(estimated_seconds % 60)
-    col3.metric("第2段階の予想処理時間", f"約 {est_min}分 {est_sec}秒")
+    col2.metric("第2段階の予想処理時間", f"約 {est_min}分 {est_sec}秒")
 
     st.info(
-        f"📊 ボリューム計測結果: **全 {total_rules} 件** の条文（`##`）が見つかりました。"
+        f"📊 ボリューム計測結果: **全 {total_rules} 件** の例規ファイルが処理対象です。"
     )
 
     # 第1段階のMarkdown Zip作成 & ダウンロード
@@ -184,10 +173,8 @@ else:
         time_area = st.empty()
 
         start_time = time.time()
-        processed_rules_count = 0
-        total_rules_count = sum(
-            v["rule_count"] for v in st.session_state.stage1_files.values()
-        )
+        processed_count = 0
+        total_rules = len(st.session_state.stage1_files)
         final_files = {}
 
         # 要約生成関数（新SDK呼び出し）
@@ -214,52 +201,40 @@ else:
                 time.sleep(8.0)
                 return "概要の自動生成に失敗しました"
 
-        # 処理ループ
+        # 1ファイル（1例規）ごとに冒頭へ1つだけ要約を付与
         for fname, fdata in st.session_state.stage1_files.items():
-            text = fdata["content"]
-            sections = re.split(r"\n(?=##\s+)", text)
-            new_sections = []
+            rule_title = fdata["title"]
+            text_content = fdata["content"]
+            processed_count += 1
 
-            for section in sections:
-                match = re.search(r"^##\s+(.+)$", section, re.MULTILINE)
-                if match:
-                    rule_title = match.group(1).strip()
-                    processed_rules_count += 1
+            # 時間・進捗計算
+            elapsed = time.time() - start_time
+            avg_time_per_item = (
+                elapsed / processed_count if processed_count > 0 else 4.5
+            )
+            remaining_items = total_rules - processed_count
+            remaining_seconds = remaining_items * avg_time_per_item
 
-                    # 時間・進捗計算
-                    elapsed = time.time() - start_time
-                    avg_time_per_item = (
-                        elapsed / processed_rules_count
-                        if processed_rules_count > 0
-                        else 4.5
-                    )
-                    remaining_items = total_rules_count - processed_rules_count
-                    remaining_seconds = remaining_items * avg_time_per_item
+            rem_min = int(remaining_seconds // 60)
+            rem_sec = int(remaining_seconds % 60)
 
-                    rem_min = int(remaining_seconds // 60)
-                    rem_sec = int(remaining_seconds % 60)
+            # 画面表示のリアルタイム更新
+            status_area.markdown(
+                f"**処理中 ({processed_count}/{total_rules} 件):** `{fname}` ➔ `{rule_title}`"
+            )
+            time_area.markdown(
+                f"⏱ 経過時間: **{int(elapsed)}秒** | 🏁 残り予想時間: **約 {rem_min}分 {rem_sec}秒**"
+            )
 
-                    # 画面表示のリアルタイム更新
-                    status_area.markdown(
-                        f"**処理中 ({processed_rules_count}/{total_rules_count} 件):** `{fname}` ➔ `## {rule_title}`"
-                    )
-                    time_area.markdown(
-                        f"⏱ 経過時間: **{int(elapsed)}秒** | 🏁 残り予想時間: **約 {rem_min}分 {rem_sec}秒**"
-                    )
+            # API呼び出しで要約を取得し、ファイルの先頭に1つだけ挿入
+            summary = get_summary(rule_title, text_content)
+            summary_tag = f"<!-- summary: {summary} -->\n"
+            final_md_content = summary_tag + text_content
 
-                    # API呼び出し
-                    summary = get_summary(rule_title, section)
-                    summary_tag = f"<!-- summary: {summary} -->\n"
-                    section = summary_tag + section
+            final_files[fname] = final_md_content
 
-                    # プログレスバー更新
-                    progress_bar.progress(
-                        processed_rules_count / total_rules_count
-                    )
-
-                new_sections.append(section)
-
-            final_files[fname] = "\n".join(new_sections)
+            # プログレスバー更新
+            progress_bar.progress(processed_count / total_rules)
 
         st.success("🎉 すべての例規への要約付与が完了しました！")
 
