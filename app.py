@@ -27,178 +27,250 @@ if not st.session_state.authenticated:
     st.stop()
 
 
-# --- 2. API Key の取得（st.secrets より取得） ---
+# --- 2. API Key の取得 ---
 api_key = None
 if "GEMINI_API_KEY" in st.secrets:
     api_key = st.secrets["GEMINI_API_KEY"]
 
 
-# --- 3. DVD固有ルールに基づく例規判定 & Markdown変換関数 ---
+# --- 3. 補助関数 ---
 def is_reiki_file(filename: str) -> bool:
     """DVDのファイル名パターンに基づく例規判定"""
     base_name = os.path.basename(filename)
-
-    # 1. bunya_ で始まるファイル
     if base_name.startswith("bunya_"):
         return True
-
-    # 2. H で始まり _J.html (または _J.htm) で終わるファイル
     base_lower = base_name.lower()
     if base_name.startswith("H") and (
         base_lower.endswith("_j.html") or base_lower.endswith("_j.htm")
     ):
         return True
-
     return False
 
 
 def convert_html_to_markdown(html_content: str) -> tuple[str, str]:
     """例規HTMLからタイトルと本文を抽出し、標準Markdownを生成"""
     soup = BeautifulSoup(html_content, "html.parser")
-
-    # 不要タグの除去
     for element in soup(["script", "style", "meta", "link"]):
         element.decompose()
 
-    # タイトルの取得
     title_tag = soup.find(["h1", "h2", "title"])
     title = title_tag.get_text(strip=True) if title_tag else "無題の例規"
 
-    # 本文テキストの取得
     text = soup.get_text(separator="\n")
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     body_text = "\n".join(lines)
 
-    # 見出し付きMarkdown生成
     md_content = f"## {title}\n\n{body_text}\n"
     return title, md_content
 
-
-# --- 4. メイン画面 ---
-st.title("📄 例規データ ナレッジ化処理システム")
-st.caption(
-    "第1段階: DVD Zip(HTML) ➔ 標準MD化 & ボリューム計測 ➔ 第2段階: MDベースでGemini要約付与"
-)
 
 # セッション状態の初期化
 if "stage1_files" not in st.session_state:
     st.session_state.stage1_files = {}
 
 
+# --- 4. メイン画面 ---
+st.title("📄 例規データ ナレッジ化処理システム")
+st.caption("【第1段階】DVD Zip(HTML) ➔ MD変換 ｜ 【第2段階】MDファイル選択 ➔ Gemini要約付与")
+
+tab1, tab2 = st.tabs(["【第1段階】HTML ➔ MD変換", "【第2段階】MD選択 ➔ 要約タグ付与"])
+
+
 # ==============================================================================
-# 【第1段階】DVD Zip (HTML等) ➔ 標準 Markdown 変換 & ダウンロード & ボリューム計測
+# 【第1段階】DVD Zip (HTML等) ➔ 標準 Markdown 変換 & ボリューム確認
 # ==============================================================================
-st.header("【第1段階】DVD Zipファイルの読み込み・Markdown変換・ボリューム確認")
+with tab1:
+    st.header("第1段階: DVD ZipファイルのMarkdown変換")
 
-uploaded_zip = st.file_uploader(
-    "DVDデータがまとまった Zip ファイルを選択してください",
-    type=["zip"],
-)
+    uploaded_dvd_zip = st.file_uploader(
+        "DVDデータ（HTML等）がまとまった Zip ファイルを選択してください",
+        type=["zip"],
+        key="dvd_zip_uploader",
+    )
 
-if uploaded_zip:
-    if st.button("⚙️ 第1段階: Markdown変換を実行"):
-        stage1_output = {}
-        skipped_count = 0
+    if uploaded_dvd_zip:
+        if st.button("⚙️ Markdown変換を実行", key="btn_stage1"):
+            stage1_output = {}
+            skipped_count = 0
 
-        with zipfile.ZipFile(uploaded_zip, "r") as z:
+            with zipfile.ZipFile(uploaded_dvd_zip, "r") as z:
+                for zip_info in z.infolist():
+                    if zip_info.filename.startswith("__MACOSX"):
+                        continue
+
+                    if is_reiki_file(zip_info.filename):
+                        with z.open(zip_info) as f:
+                            content_bytes = f.read()
+                            try:
+                                html_text = content_bytes.decode("cp932")
+                            except UnicodeDecodeError:
+                                html_text = content_bytes.decode(
+                                    "utf-8", errors="ignore"
+                                )
+
+                            rule_title, md_text = convert_html_to_markdown(
+                                html_text
+                            )
+                            md_filename = (
+                                os.path.basename(zip_info.filename).rsplit(
+                                    ".", 1
+                                )[0]
+                                + ".md"
+                            )
+
+                            stage1_output[md_filename] = {
+                                "title": rule_title,
+                                "content": md_text,
+                                "length": len(md_text),
+                            }
+                    else:
+                        skipped_count += 1
+
+            st.session_state.stage1_files = stage1_output
+            st.success(
+                f"✅ 抽出完了: **{len(stage1_output)} 件** の例規をMarkdown化しました。（対象外 {skipped_count} 件除外）"
+            )
+
+    if st.session_state.stage1_files:
+        st.subheader("📊 第1段階の変換成果物一覧")
+
+        # Zipダウンロードボタン
+        zip_buffer_stage1 = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer_stage1, "w") as zf:
+            for fname, fdata in st.session_state.stage1_files.items():
+                zf.writestr(fname, fdata["content"].encode("utf-8"))
+
+        st.download_button(
+            label="📥 第1段階の全MDファイルをZipでダウンロード",
+            data=zip_buffer_stage1.getvalue(),
+            file_name="reiki_standard_markdown.zip",
+            mime="application/zip",
+        )
+
+        # ファイルごとのボリューム（文字数）表示
+        file_data_list = [
+            {
+                "ファイル名": fname,
+                "タイトル": fdata["title"],
+                "文字数 (ボリューム)": f"{fdata['length']:,} 文字",
+            }
+            for fname, fdata in st.session_state.stage1_files.items()
+        ]
+        st.dataframe(file_data_list, use_container_width=True)
+
+
+# ==============================================================================
+# 【第2段階】MDファイルを選択して要約を付与
+# ==============================================================================
+with tab2:
+    st.header("第2段階: Markdownファイルへの要約・タグ自動付与")
+
+    # データソースの確保（メモリ上 または Zipアップロード）
+    target_md_files = {}
+
+    if st.session_state.stage1_files:
+        st.info("💡 第1段階で変換したデータがメモリ内に保持されています。")
+        target_md_files = {
+            fname: fdata["content"]
+            for fname, fdata in st.session_state.stage1_files.items()
+        }
+
+    # 事前にダウンロードしたZipがある場合のアップローダー
+    uploaded_md_zip = st.file_uploader(
+        "（任意）手元の Markdown Zip ファイルを読み込んで処理する場合はこちらを選択してください",
+        type=["zip"],
+        key="md_zip_uploader",
+    )
+
+    if uploaded_md_zip:
+        zip_md_files = {}
+        with zipfile.ZipFile(uploaded_md_zip, "r") as z:
             for zip_info in z.infolist():
                 if zip_info.filename.startswith("__MACOSX"):
                     continue
-
-                if is_reiki_file(zip_info.filename):
+                if zip_info.filename.endswith(".md"):
                     with z.open(zip_info) as f:
-                        content_bytes = f.read()
-                        try:
-                            html_text = content_bytes.decode("cp932")
-                        except UnicodeDecodeError:
-                            html_text = content_bytes.decode(
-                                "utf-8", errors="ignore"
-                            )
-
-                        rule_title, md_text = convert_html_to_markdown(
-                            html_text
-                        )
-                        md_filename = (
-                            os.path.basename(zip_info.filename).rsplit(".", 1)[
-                                0
-                            ]
-                            + ".md"
-                        )
-
-                        # 第1段階の成果物（MD本文）をメモリ上に保存
-                        stage1_output[md_filename] = {
-                            "title": rule_title,
-                            "content": md_text,
-                        }
-                else:
-                    skipped_count += 1
-
-        st.session_state.stage1_files = stage1_output
+                        fname = os.path.basename(zip_info.filename)
+                        zip_md_files[fname] = f.read().decode("utf-8")
+        target_md_files = zip_md_files
         st.success(
-            f"✅ 第1段階のMarkdown変換処理が完了しました！（対象外のシステムファイル {skipped_count} 件を除外）"
+            f"📁 Zipから **{len(target_md_files)} 件** のMarkdownファイルを読み込みました。"
         )
 
-# 第1段階のデータが存在する場合のボリューム表示 & ダウンロードボタン
-if st.session_state.stage1_files:
-    total_rules = len(st.session_state.stage1_files)
+    if not target_md_files:
+        st.warning(
+            "⚠️ 処理対象のデータがありません。第1段階を実行するか、Markdown Zipをアップロードしてください。"
+        )
+    else:
+        st.subheader("🎯 処理対象ファイルの選択")
 
-    col1, col2 = st.columns(2)
-    col1.metric("対象例規数（抽出件数）", f"{total_rules} 件")
+        # 全選択/全解除ボタン
+        col_btn1, col_btn2, _ = st.columns([1, 1, 4])
+        select_all = col_btn1.button("全選択")
+        deselect_all = col_btn2.button("全解除")
 
-    estimated_seconds = total_rules * 4.5
-    est_min = int(estimated_seconds // 60)
-    est_sec = int(estimated_seconds % 60)
-    col2.metric("第2段階の予想処理時間", f"約 {est_min}分 {est_sec}秒")
+        if "selected_files" not in st.session_state or select_all:
+            st.session_state.selected_files = list(target_md_files.keys())
+        elif deselect_all:
+            st.session_state.selected_files = []
 
-    st.info(
-        f"📊 ボリューム計測結果: **全 {total_rules} 件** のMarkdown化データが第2段階の入力ベースとなります。"
-    )
+        # ファイルごとのボリューム表示付きマルチセレクトボックス
+        file_options = {
+            f"{fname}  ({len(content):,}文字)": fname
+            for fname, content in target_md_files.items()
+        }
 
-    # 第1段階のMarkdown Zip作成 & ダウンロード
-    zip_buffer_stage1 = io.BytesIO()
-    with zipfile.ZipFile(zip_buffer_stage1, "w") as zf:
-        for fname, fdata in st.session_state.stage1_files.items():
-            zf.writestr(fname, fdata["content"].encode("utf-8"))
+        # デフォルト選択値の整合性チェック
+        current_default_keys = [
+            f"{fname}  ({len(target_md_files[fname]):,}文字)"
+            for fname in st.session_state.selected_files
+            if fname in target_md_files
+        ]
 
-    st.download_button(
-        label="📥 第1段階: 変換済み標準Markdown Zipをダウンロード",
-        data=zip_buffer_stage1.getvalue(),
-        file_name="reiki_standard_markdown.zip",
-        mime="application/zip",
-    )
+        selected_display_names = st.multiselect(
+            "要約処理を実行するファイルを選択してください（テストで1〜2件のみ選択することも可能です）",
+            options=list(file_options.keys()),
+            default=current_default_keys,
+        )
 
-st.divider()
+        selected_fnames = [
+            file_options[disp_name] for disp_name in selected_display_names
+        ]
+        st.session_state.selected_files = selected_fnames
 
+        selected_count = len(selected_fnames)
+        estimated_seconds = selected_count * 4.5
+        est_min = int(estimated_seconds // 60)
+        est_sec = int(estimated_seconds % 60)
 
-# ==============================================================================
-# 【第2段階】第1段階のMarkdownデータをベースにした要約・タグ自動付与
-# ==============================================================================
-st.header("【第2段階】Markdownベースでの要約・タグの自動付与（Gemini API）")
+        col_m1, col_m2 = st.columns(2)
+        col_m1.metric("選択中のファイル数", f"{selected_count} / {len(target_md_files)} 件")
+        col_m2.metric("予想処理時間", f"約 {est_min}分 {est_sec}秒")
 
-if not st.session_state.stage1_files:
-    st.warning(
-        "⚠️ 先に【第1段階】の変換処理を実行してデータを生成してください。"
-    )
-elif not api_key:
-    st.error(
-        "❌ Streamlit Secrets に `GEMINI_API_KEY` が設定されていません。Settings > Secrets を確認してください。"
-    )
-else:
-    client = genai.Client(api_key=api_key)
+        if selected_count > 0:
+            if not api_key:
+                st.error(
+                    "❌ Streamlit Secrets に `GEMINI_API_KEY` が設定されていません。"
+                )
+            else:
+                client = genai.Client(api_key=api_key)
 
-    if st.button("🚀 第2段階: 要約の自動付与を開始する"):
-        progress_bar = st.progress(0)
-        status_area = st.empty()
-        time_area = st.empty()
+                if st.button(
+                    f"🚀 選択した {selected_count} 件に要約・タグを自動付与する",
+                    key="btn_stage2",
+                ):
+                    progress_bar = st.progress(0)
+                    status_area = st.empty()
+                    time_area = st.empty()
 
-        start_time = time.time()
-        processed_count = 0
-        total_rules = len(st.session_state.stage1_files)
-        final_files = {}
+                    start_time = time.time()
+                    processed_count = 0
+                    final_files = {}
 
-        def get_summary_from_md(md_content):
-            """第1段階で生成したMarkdown本文をそのまま渡して要約を取得"""
-            prompt = f"""
+                    def get_summary_with_retry(
+                        md_content, max_retries=3
+                    ) -> str:
+                        prompt = f"""
 あなたは自治体例規の整理補助AIです。
 以下の例規Markdownデータを読み、概要とカテゴリを以下のフォーマットで短く出力してください。
 
@@ -208,60 +280,68 @@ else:
 【出力フォーマット】
 概要：[1〜2文で何について定めたものか] / 対象カテゴリ：[関連する検索単語や分野をカンマ区切りで3〜5個]
 """
-            try:
-                response = client.models.generate_content(
-                    model="gemini-2.0-flash",
-                    contents=prompt,
-                )
-                time.sleep(4.0)  # レート制限対策
-                return response.text.strip().replace("\n", " ")
-            except Exception as e:
-                time.sleep(8.0)
-                return "概要の自動生成に失敗しました"
+                        for attempt in range(max_retries):
+                            try:
+                                response = client.models.generate_content(
+                                    model="gemini-2.0-flash",
+                                    contents=prompt,
+                                )
+                                time.sleep(4.5)
+                                return response.text.strip().replace("\n", " ")
+                            except Exception:
+                                if attempt < max_retries - 1:
+                                    time.sleep((attempt + 1) * 10)
+                                else:
+                                    return (
+                                        "概要の自動生成に失敗しました（API制限）"
+                                    )
 
-        # 第1段階で作成したMDデータを順次処理
-        for fname, fdata in st.session_state.stage1_files.items():
-            rule_title = fdata["title"]
-            md_text = fdata["content"]  # 第1段階のMDデータ
-            processed_count += 1
+                    for fname in selected_fnames:
+                        md_text = target_md_files[fname]
+                        processed_count += 1
 
-            # 残り時間計算
-            elapsed = time.time() - start_time
-            avg_time_per_item = (
-                elapsed / processed_count if processed_count > 0 else 4.5
-            )
-            remaining_items = total_rules - processed_count
-            remaining_seconds = remaining_items * avg_time_per_item
+                        elapsed = time.time() - start_time
+                        avg_time = (
+                            elapsed / processed_count
+                            if processed_count > 0
+                            else 4.5
+                        )
+                        rem_sec = int(
+                            (selected_count - processed_count) * avg_time
+                        )
+                        rem_min = rem_sec // 60
+                        rem_sec = rem_sec % 60
 
-            rem_min = int(remaining_seconds // 60)
-            rem_sec = int(remaining_seconds % 60)
+                        status_area.markdown(
+                            f"**処理中 ({processed_count}/{selected_count} 件):** `{fname}`"
+                        )
+                        time_area.markdown(
+                            f"⏱ 経過時間: **{int(elapsed)}秒** | 🏁 残り予想時間: **約 {rem_min}分 {rem_sec}秒**"
+                        )
 
-            status_area.markdown(
-                f"**処理中 ({processed_count}/{total_rules} 件):** `{fname}` （{rule_title}）"
-            )
-            time_area.markdown(
-                f"⏱ 経過時間: **{int(elapsed)}秒** | 🏁 残り予想時間: **約 {rem_min}分 {rem_sec}秒**"
-            )
+                        # 既に要約タグがある場合はスキップして二重タグ防止
+                        if md_text.startswith("<!-- summary:"):
+                            final_files[fname] = md_text
+                        else:
+                            summary = get_summary_with_retry(md_text)
+                            summary_tag = f"<!-- summary: {summary} -->\n"
+                            final_files[fname] = summary_tag + md_text
 
-            # 第1段階のMDから要約文を生成
-            summary = get_summary_from_md(md_text)
-            summary_tag = f"<!-- summary: {summary} -->\n"
+                        progress_bar.progress(processed_count / selected_count)
 
-            # 第1段階のMDテキストの「先頭」に要約タグをそのまま結合
-            final_files[fname] = summary_tag + md_text
-            progress_bar.progress(processed_count / total_rules)
+                    st.success(
+                        f"🎉 選択した {selected_count} 件への要約付与が完了しました！"
+                    )
 
-        st.success("🎉 すべてのMarkdownファイルへの要約付与が完了しました！")
+                    # 完成版Zipダウンロード
+                    zip_buffer_stage2 = io.BytesIO()
+                    with zipfile.ZipFile(zip_buffer_stage2, "w") as zf:
+                        for fname, fcontent in final_files.items():
+                            zf.writestr(fname, fcontent.encode("utf-8"))
 
-        # 最終完成版のZipファイル作成
-        zip_buffer_stage2 = io.BytesIO()
-        with zipfile.ZipFile(zip_buffer_stage2, "w") as zf:
-            for fname, fcontent in final_files.items():
-                zf.writestr(fname, fcontent.encode("utf-8"))
-
-        st.download_button(
-            label="📦 第2段階: 完成したナレッジZipファイルをダウンロード",
-            data=zip_buffer_stage2.getvalue(),
-            file_name="reiki_knowledge_summary_added.zip",
-            mime="application/zip",
-        )
+                    st.download_button(
+                        label="📦 処理済みナレッジZip（reiki_knowledge_selected.zip）をダウンロード",
+                        data=zip_buffer_stage2.getvalue(),
+                        file_name="reiki_knowledge_selected.zip",
+                        mime="application/zip",
+                    )
