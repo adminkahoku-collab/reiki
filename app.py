@@ -18,11 +18,11 @@ password = st.sidebar.text_input("職員用パスワード", type="password")
 # --- Streamlit Secrets から Gemini API キーを取得 ---
 gemini_api_key = st.secrets.get("GEMINI_API_KEY", "")
 
-# --- Geminiによる例規ごとの要約生成関数（モデル自動切り替え＆無料枠対応） ---
+# --- Geminiによる例規ごとの要約生成関数（503混雑リトライ＆無料枠対応） ---
 def generate_summary_with_gemini(
     title: str, content: str, api_key: str
 ) -> str:
-  """無料枠（RPM 15 / RPD 1500）のモデルを利用して要約を生成"""
+  """サーバー混雑(503)やレート制限(429)に対応した要約生成関数"""
   if not api_key:
     return "（APIキー未設定のため要約スキップ）"
 
@@ -42,51 +42,52 @@ def generate_summary_with_gemini(
 
   client = genai.Client(api_key=api_key)
 
-  # 利用を試みるモデルの優先順リスト（404エラー対策）
+  # 安定して動作する標準モデルを最優先に配置
   candidate_models = [
-      "gemini-1.5-flash",
+      "gemini-2.5-flash",
       "gemini-2.0-flash",
-      "gemini-3.8-flash",
+      "gemini-1.5-flash",
   ]
 
   for model_name in candidate_models:
-    try:
-      response = client.models.generate_content(
-          model=model_name,
-          contents=prompt,
-      )
+    max_retries = 3  # モデルごとに最大3回リトライ
+    for attempt in range(max_retries):
+      try:
+        response = client.models.generate_content(
+            model=model_name,
+            contents=prompt,
+        )
 
-      # 1分15回制限（RPM 15）対策：1回成功ごとに4.5秒待機
-      time.sleep(4.5)
-      return response.text.strip()
+        # 無料枠(RPM 15)遵守のため4.5秒待機
+        time.sleep(4.5)
+        return response.text.strip()
 
-    except Exception as e:
-      err_str = str(e)
-      # 404（モデルが存在しない・廃止）の場合は次の候補モデルへ移行
-      if "404" in err_str or "NOT_FOUND" in err_str:
-        continue
+      except Exception as e:
+        err_str = str(e)
 
-      # 429（レート制限）の場合は待機して再試行
-      if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-        st.warning(f"レート制限検知。15秒待機して再試行します... ({title})")
-        time.sleep(15)
-        try:
-          response = client.models.generate_content(
-              model=model_name,
-              contents=prompt,
+        # 404（モデル不存在）の場合は即座に次のモデル候補へ
+        if "404" in err_str or "NOT_FOUND" in err_str:
+          break
+
+        # 503（サーバー混雑）または 429（レート制限）の場合は待機して再試行
+        if (
+            "503" in err_str
+            or "UNAVAILABLE" in err_str
+            or "429" in err_str
+            or "RESOURCE_EXHAUSTED" in err_str
+        ):
+          wait_time = 10 * (attempt + 1)  # 10秒、20秒...と待機時間を伸ばす
+          st.warning(
+              f"サーバー混雑/制限検知 ({model_name})。{wait_time}秒後に再試行します... ({title})"
           )
-          time.sleep(4.5)
-          return response.text.strip()
-        except Exception:
-          pass
+          time.sleep(wait_time)
+          continue
 
-      st.warning(
-          f"Gemini APIエラー ({model_name} / {title}): {e}"
-      )
-      break
+        # その他のエラーはログを出して次のモデルへ
+        st.warning(f"Gemini APIエラー ({model_name} / {title}): {e}")
+        break
 
-  return "（要約生成エラー：有効なモデルが見つかりません）"
-
+  return "（要約生成エラー：一時的なサーバー混雑）"
 
 # --- メイン処理 ---
 if password == "reiki063215":
