@@ -1,5 +1,6 @@
 import io
 import re
+import time
 import zipfile
 from bs4 import BeautifulSoup
 from google import genai
@@ -17,12 +18,11 @@ password = st.sidebar.text_input("職員用パスワード", type="password")
 # --- Streamlit Secrets から Gemini API キーを取得 ---
 gemini_api_key = st.secrets.get("GEMINI_API_KEY", "")
 
-
-# --- Geminiによる例規ごとの要約生成関数 ---
+# --- Geminiによる例規ごとの要約生成関数（リトライ＆ウェイト対応） ---
 def generate_summary_with_gemini(
     title: str, content: str, api_key: str
 ) -> str:
-  """Gemini を使用して例規ごとの要約を生成"""
+  """Gemini を使用して例規ごとの要約を生成（レート制限対策付き）"""
   if not api_key:
     return "（APIキー未設定のため要約スキップ）"
 
@@ -39,16 +39,35 @@ def generate_summary_with_gemini(
 本文:
 {content[:2000]}
 """
-  try:
-    client = genai.Client(api_key=api_key)
-    response = client.models.generate_content(
-        model="gemini-3.6-flash",
-        contents=prompt,
-    )
-    return response.text.strip()
-  except Exception as e:
-    st.warning(f"Gemini API（要約生成）でエラー ({title}): {e}")
-    return "（要約生成エラー）"
+
+  client = genai.Client(api_key=api_key)
+
+  # 429エラーが発生した際のリトライ処理（最大3回まで試行）
+  max_retries = 3
+  for attempt in range(max_retries):
+    try:
+      response = client.models.generate_content(
+          model="gemini-2.5-flash",
+          contents=prompt,
+      )
+
+      # 無料枠の制限（1分5回）を考慮し、成功後も12秒間ウェイトを置く
+      time.sleep(12)
+      return response.text.strip()
+
+    except Exception as e:
+      if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+        if attempt < max_retries - 1:
+          wait_time = 25  # エラーメッセージの指示通り25秒待機して再試行
+          st.warning(
+              f"API制限に達したため、{wait_time}秒待機して再試行します... ({title})"
+          )
+          time.sleep(wait_time)
+          continue
+      st.warning(f"Gemini API（要約生成）でエラー ({title}): {e}")
+      return "（要約生成エラー）"
+
+  return "（要約生成エラー：リトライ上限到達）"
 
 
 # --- メイン処理 ---
