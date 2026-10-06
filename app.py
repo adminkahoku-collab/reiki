@@ -62,16 +62,16 @@ def extract_13_hens_from_zip(zip_file_bytes) -> dict[str, str]:
   with zipfile.ZipFile(io.BytesIO(zip_file_bytes)) as z:
     file_map = {f.lower().replace("\\", "/"): f for f in z.namelist()}
 
-    # 1. 目次ファイル (bunya_00100000.html) のパスを特定
+    # 1. 目次ファイル (bunya_0010000.html) のパスを特定
     bunya_path = None
     for norm_f, raw_f in file_map.items():
-      if os.path.basename(norm_f) == "bunya_00100000.html":
+      if os.path.basename(norm_f) == "bunya_0010000.html":
         bunya_path = raw_f
         break
 
     if not bunya_path:
       st.error(
-          "⚠️ 目次ファイル (bunya_00100000.html) がZIP内に見つかりませんでした。"
+          "⚠️ 目次ファイル (bunya_0010000.html) がZIP内に見つかりませんでした。"
       )
       return {}
 
