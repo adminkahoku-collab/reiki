@@ -46,7 +46,6 @@ def convert_zip_to_md_dict(zip_file_bytes) -> dict[str, str]:
   md_dict = {}
 
   with zipfile.ZipFile(io.BytesIO(zip_file_bytes)) as z:
-    # フォルダ（編）ごとにHTMLファイルを整理
     hen_groups = {}
     for filename in z.namelist():
       if filename.endswith("/") or filename.startswith("__MACOSX"):
@@ -55,7 +54,7 @@ def convert_zip_to_md_dict(zip_file_bytes) -> dict[str, str]:
       ext = os.path.splitext(filename)[1].lower()
       if ext in [".html", ".htm"]:
         parts = filename.split("/")
-        # フォルダ構造から編名を取得（フォルダがない場合はルート）
+        # フォルダ名から編名を取得（フォルダ構造がない場合のフォールバックあり）
         hen_name = (
             parts[0]
             if len(parts) > 1
@@ -103,7 +102,7 @@ def summarize_chunk_with_gemini(
 
   rules_text = ""
   for idx, r in enumerate(rules_chunk, 1):
-    body_truncated = r["body"][:1500]  # トークン節約
+    body_truncated = r["body"][:1500]  # トークン節約のため先頭1500文字に制限
     rules_text += (
         f"--- 例規{idx} ---\nタイトル: {r['title']}\n本文:\n{body_truncated}\n\n"
     )
@@ -173,8 +172,8 @@ st.set_page_config(
 
 st.title("📜 自治体例規集 全自動変換＆要約システム (Cloud完全対応版)")
 st.markdown(
-    "DVDデータ（ZIP形式）または作成済みのMarkdown（.md）をアップロードするだけで、**データの変換からGemini"
-    " APIによる要約付与までブラウザ上で完結**します。"
+    "DVDデータ（ZIP形式）をアップロードするだけで、**Markdown形式への内部変換からGemini"
+    " APIによる要約付与までを一気通貫で処理**します。"
 )
 
 # APIキーの取得（Secrets優先、なければサイドバー入力）
@@ -199,52 +198,37 @@ if not gemini_api_key:
   )
   st.stop()
 
-# セッション状態管理
+# セッション状態管理（メモリ保存用）
 if "md_dict" not in st.session_state:
-  st.session_state.md_dict = {}
+  st.session_state.md_dict = {}  # 変換後のMarkdownデータ格納用
 if "updated_md_dict" not in st.session_state:
-  st.session_state.updated_md_dict = {}
+  st.session_state.updated_md_dict = {}  # 要約付与後のMarkdownデータ格納用
 
-# --- ステップ1: データ取込・変換 ---
-st.header("1. 例規データの読み込み（ZIP または MDファイル）")
+# --- ステップ1: ZIPファイルの読み込みと自動変換 ---
+st.header("1. DVDデータ（ZIPファイル）の読み込み")
 
-upload_type = st.radio(
-    "アップロードするデータ形式を選択してください:",
-    ["DVDデータ（HTML群のZIPアーカイブ）", "作成済みMarkdownファイル（.md）"],
-    horizontal=True,
+uploaded_zip = st.file_uploader(
+    "DVD内の各編フォルダをまとめたZIPファイルをアップロードしてください",
+    type=["zip"],
 )
 
-if upload_type == "DVDデータ（HTML群のZIPアーカイブ）":
-  uploaded_zip = st.file_uploader(
-      "DVD内の各編フォルダをまとめたZIPファイルをアップロードしてください",
-      type=["zip"],
-  )
-  if uploaded_zip:
-    if st.button("🔨 ZIPを解析してMarkdownに変換する"):
-      with st.spinner("ZIPファイル内のHTMLを解析・Markdown変換中..."):
-        st.session_state.md_dict = convert_zip_to_md_dict(
-            uploaded_zip.getvalue()
-        )
-      st.success(
-          f"変換完了！ {len(st.session_state.md_dict)} 編のMarkdownデータを生成しました。"
-      )
+if uploaded_zip:
+  # アップロードされたZIPから読み込み変換（自動実行）
+  if (
+      "loaded_zip_name" not in st.session_state
+      or st.session_state.loaded_zip_name != uploaded_zip.name
+  ):
+    with st.spinner("ZIPファイル内のHTMLを自動解析して内部データを作成中..."):
+      st.session_state.md_dict = convert_zip_to_md_dict(uploaded_zip.getvalue())
+      st.session_state.loaded_zip_name = uploaded_zip.name
 
-else:
-  uploaded_mds = st.file_uploader(
-      "13編のMarkdown（.md）ファイルをまとめてドラッグ＆ドロップしてください",
-      type=["md"],
-      accept_multiple_files=True,
-  )
-  if uploaded_mds:
-    sorted_files = sorted(uploaded_mds, key=lambda x: x.name)
-    for uploaded_file in sorted_files:
-      string_data = uploaded_file.getvalue().decode("utf-8")
-      st.session_state.md_dict[uploaded_file.name] = string_data
+  if st.session_state.md_dict:
     st.success(
-        f"合計 {len(st.session_state.md_dict)} 件のファイルを読み込みました。"
+        f"✅ 解析完了！ 全 {len(st.session_state.md_dict)} 編のデータが準備できました。"
+        " 下の「ステップ2」へ進んでください。"
     )
 
-# --- ステップ2: 要約生成の実行 ---
+# --- ステップ2: 選択した編の要約生成 ---
 if st.session_state.md_dict:
   st.divider()
   st.header("2. 要約付与処理の実行")
@@ -252,8 +236,8 @@ if st.session_state.md_dict:
   run_mode = st.radio(
       "処理モードを選択してください:",
       [
-          "選択した編ファイルのみ処理する（推奨: タイムアウト防止）",
-          "全ファイル（全編）を一括処理する",
+          "選択した編のみ処理する（推奨: タイムアウト・エラー防止）",
+          "全編を一括処理する",
       ],
       horizontal=True,
   )
@@ -261,72 +245,77 @@ if st.session_state.md_dict:
   selected_keys = []
   if "選択した編" in run_mode:
     selected_keys = st.multiselect(
-        "処理対象の編ファイルを選択してください:",
+        "要約を生成したい編を選択してください（複数選択可）:",
         list(st.session_state.md_dict.keys()),
         default=list(st.session_state.md_dict.keys())[0:1],
     )
   else:
     selected_keys = list(st.session_state.md_dict.keys())
 
-  if st.button("🤖 要約生成を開始する", type="primary"):
-    progress_bar = st.progress(0)
-    status_text = st.empty()
+  if st.button("🤖 選択した編の要約生成を開始する", type="primary"):
+    if not selected_keys:
+      st.warning("処理対象の編が選択されていません。")
+    else:
+      progress_bar = st.progress(0)
+      status_text = st.empty()
 
-    total_files = len(selected_keys)
+      total_files = len(selected_keys)
 
-    for file_idx, file_name in enumerate(selected_keys):
-      content = st.session_state.md_dict[file_name]
+      for file_idx, file_name in enumerate(selected_keys):
+        content = st.session_state.md_dict[file_name]
 
-      rules_raw = content.split("## ")
-      header = rules_raw[0]
+        rules_raw = content.split("## ")
+        header = rules_raw[0]
 
-      parsed_rules = []
-      for block in rules_raw[1:]:
-        lines = block.split("\n")
-        title = lines[0].strip()
-        body = "\n".join(lines[1:])
-        parsed_rules.append({"title": title, "body": body})
+        parsed_rules = []
+        for block in rules_raw[1:]:
+          lines = block.split("\n")
+          title = lines[0].strip()
+          body = "\n".join(lines[1:])
+          parsed_rules.append({"title": title, "body": body})
 
-      total_rules_in_file = len(parsed_rules)
-      all_summaries = {}
+        total_rules_in_file = len(parsed_rules)
+        all_summaries = {}
 
-      chunk_size = 10
-      for i in range(0, total_rules_in_file, chunk_size):
-        chunk = parsed_rules[i : i + chunk_size]
-        end_idx = min(i + chunk_size, total_rules_in_file)
+        # 10件ずつまとめてAPIに送信
+        chunk_size = 10
+        for i in range(0, total_rules_in_file, chunk_size):
+          chunk = parsed_rules[i : i + chunk_size]
+          end_idx = min(i + chunk_size, total_rules_in_file)
 
-        status_text.info(
-            f"📄 **[{file_idx+1}/{total_files}] {file_name}** を処理中..."
-            f" ({i+1}〜{end_idx} / 全{total_rules_in_file}件)"
-        )
+          status_text.info(
+              f"📄 **[{file_idx+1}/{total_files}] {file_name}** を処理中..."
+              f" ({i+1}〜{end_idx} / 全{total_rules_in_file}件)"
+          )
 
-        chunk_summaries = summarize_chunk_with_gemini(chunk, gemini_api_key)
-        all_summaries.update(chunk_summaries)
+          chunk_summaries = summarize_chunk_with_gemini(chunk, gemini_api_key)
+          all_summaries.update(chunk_summaries)
 
-      # 組み立て
-      updated_content = header
-      for r in parsed_rules:
-        summary_text = all_summaries.get(
-            r["title"], "（要約生成エラー：一時的な混雑または出力不可）"
-        )
-        formatted_summary = "> " + summary_text.replace("\n", "\n> ")
-        updated_content += (
-            f"## {r['title']}\n\n> **【概要・要約】**\n{formatted_summary}\n\n{r['body']}"
-        )
+        # 元のMarkdown構造に要約を埋め込んで再構築
+        updated_content = header
+        for r in parsed_rules:
+          summary_text = all_summaries.get(
+              r["title"], "（要約生成エラー：一時的な混雑または出力不可）"
+          )
+          formatted_summary = "> " + summary_text.replace("\n", "\n> ")
+          updated_content += (
+              f"## {r['title']}\n\n> **【概要・要約】**\n{formatted_summary}\n\n{r['body']}"
+          )
 
-      st.session_state.updated_md_dict[file_name] = updated_content
-      progress_bar.progress((file_idx + 1) / total_files)
+        # 処理完了データをセッションに保存
+        st.session_state.updated_md_dict[file_name] = updated_content
+        progress_bar.progress((file_idx + 1) / total_files)
 
-    status_text.empty()
-    st.success("🎉 指定したファイルの要約付与処理が完了しました！")
+      status_text.empty()
+      st.success("🎉 指定した編の要約付与処理が完了しました！")
 
-# --- ステップ3: 結果確認 & ダウンロード ---
+# --- ステップ3: 処理結果の確認 & ダウンロード ---
 if st.session_state.updated_md_dict:
   st.divider()
-  st.header("3. 処理結果の確認とダウンロード")
+  st.header("3. 要約付きMarkdownファイルのダウンロード")
 
   preview_file = st.selectbox(
-      "確認・ダウンロードするファイルを選択してください:",
+      "ダウンロード・確認する編を選択してください:",
       list(st.session_state.updated_md_dict.keys()),
   )
 
@@ -342,19 +331,19 @@ if st.session_state.updated_md_dict:
       )
 
   with col2:
-    # 処理完了済みのファイルをまとめてZIPダウンロード
+    # これまでに要約処理が完了したすべての編をまとめてZIP化
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w") as zf:
       for fname, fcontent in st.session_state.updated_md_dict.items():
         zf.writestr(f"summary_{fname}", fcontent)
 
     st.download_button(
-        label="📦 処理完了した全ファイルを一括ZIPダウンロード",
+        label="📦 完了済みの全編をまとめて一括ZIPダウンロード",
         data=zip_buffer.getvalue(),
-        file_name="all_summarized_reiki.zip",
+        file_name="summarized_reiki_all.zip",
         mime="application/zip",
     )
 
   if preview_file:
-    with st.expander("👁️ プレビューを表示（先頭2,000文字）"):
+    with st.expander("👁️ 完成データのプレビュー表示（先頭2,000文字）"):
       st.text(st.session_state.updated_md_dict[preview_file][:2000] + "\n...")
