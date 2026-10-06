@@ -65,7 +65,13 @@ def extract_13_hens_from_zip(zip_file_bytes) -> dict[str, str]:
     # 1. 目次ファイル (bunya_0010000.html) のパスを特定
     bunya_path = None
     for norm_f, raw_f in file_map.items():
-      if os.path.basename(norm_f) == "bunya_0010000.html":
+      filename = os.path.basename(norm_f)
+      # bunya_0010000.html または bunya_ から始まるトップ目次を検索
+      if (
+          filename == "bunya_0010000.html"
+          or filename == "bunya_00100000.html"
+          or filename.startswith("bunya_00")
+      ):
         bunya_path = raw_f
         break
 
@@ -274,7 +280,7 @@ with st.sidebar:
   st.divider()
   st.markdown("### 📌 処理手順")
   st.caption("1. DVDのZIPをアップロード")
-  st.caption("2. 目次(bunya_00100000.html)に基づき13編の.mdを出力")
+  st.caption("2. 目次(bunya_0010000.html)に基づき13編の.mdを出力")
   st.caption("3. 各編にAI要約を付与")
 
 if not gemini_api_key:
@@ -288,185 +294,4 @@ if "updated_md_dict" not in st.session_state:
   st.session_state.updated_md_dict = {}
 
 # --- ステップ1: DVD(ZIP)のアップロードと13編Markdown化 ---
-st.header("1. DVDデータ（ZIPファイル）のアップロード")
-
-uploaded_zip = st.file_uploader(
-    "DVDのZIPファイルをアップロードしてください", type=["zip"]
-)
-
-if uploaded_zip:
-  if (
-      "loaded_zip_name" not in st.session_state
-      or st.session_state.loaded_zip_name != uploaded_zip.name
-  ):
-    with st.spinner(
-        "bunya_00100000.html（目次）の階層構造を解析し、13編の例規データ(H*****_J.html)を集約中..."
-    ):
-      st.session_state.md_dict = extract_13_hens_from_zip(
-          uploaded_zip.getvalue()
-      )
-      st.session_state.loaded_zip_name = uploaded_zip.name
-
-  if st.session_state.md_dict:
-    st.success(
-        f"✅ 目次解析完了！ **合計 {len(st.session_state.md_dict)} 件の編（Markdownファイル）**"
-        " に正しく分割・作成されました。"
-    )
-
-    # 13編の分割結果一覧
-    with st.expander("📋 作成されたMarkdownファイル一覧を確認"):
-      for fname in sorted(st.session_state.md_dict.keys()):
-        rule_count = st.session_state.md_dict[fname].count("\n## ")
-        st.write(f"- **{fname}**（収録例規数: 約 {rule_count} 件）")
-
-    # 未要約Markdownの確認・ダウンロード
-    st.markdown("#### 📥 変換された13編のMarkdownファイルをダウンロード・確認")
-
-    col_raw1, col_raw2 = st.columns(2)
-    selected_raw_file = st.selectbox(
-        "確認・ダウンロードする編を選択:",
-        sorted(list(st.session_state.md_dict.keys())),
-        key="raw_select",
-    )
-
-    with col_raw1:
-      if selected_raw_file:
-        st.download_button(
-            label=f"📄 {selected_raw_file} (未要約) をダウンロード",
-            data=st.session_state.md_dict[selected_raw_file],
-            file_name=selected_raw_file,
-            mime="text/markdown",
-        )
-
-    with col_raw2:
-      raw_zip_buffer = io.BytesIO()
-      with zipfile.ZipFile(raw_zip_buffer, "w") as zf:
-        for fname, fcontent in st.session_state.md_dict.items():
-          zf.writestr(fname, fcontent)
-
-      st.download_button(
-          label="📦 全13編の未要約MarkdownをまとめてZIPダウンロード",
-          data=raw_zip_buffer.getvalue(),
-          file_name="unsummarized_13_hens.zip",
-          mime="application/zip",
-      )
-
-    with st.expander("👁 選択中の編のプレビュー表示（先頭1,500文字）"):
-      st.text(st.session_state.md_dict[selected_raw_file][:1500] + "\n...")
-
-# --- ステップ2: 対象の編を選択してAI要約を生成 ---
-if st.session_state.md_dict:
-  st.divider()
-  st.header("2. 編を選択して要約の生成を開始")
-
-  run_mode = st.radio(
-      "実行モード:",
-      [
-          "選択した編のみ要約する（推奨: タイムアウト防止）",
-          "全編を一括で要約する",
-      ],
-      horizontal=True,
-  )
-
-  selected_keys = []
-  if "選択した編" in run_mode:
-    selected_keys = st.multiselect(
-        "要約を生成する編を選択してください（1編ずつを推奨）:",
-        sorted(list(st.session_state.md_dict.keys())),
-        default=sorted(list(st.session_state.md_dict.keys()))[0:1],
-    )
-  else:
-    selected_keys = sorted(list(st.session_state.md_dict.keys()))
-
-  if st.button("🤖 選択した編の要約生成を開始する", type="primary"):
-    if not selected_keys:
-      st.warning("処理対象の編が選択されていません。")
-    else:
-      progress_bar = st.progress(0)
-      status_text = st.empty()
-
-      total_files = len(selected_keys)
-
-      for file_idx, file_name in enumerate(selected_keys):
-        content = st.session_state.md_dict[file_name]
-
-        rules_raw = content.split("## ")
-        header = rules_raw[0]
-
-        parsed_rules = []
-        for block in rules_raw[1:]:
-          lines = block.split("\n")
-          title = lines[0].strip()
-          body = "\n".join(lines[1:])
-          parsed_rules.append({"title": title, "body": body})
-
-        total_rules_in_file = len(parsed_rules)
-        all_summaries = {}
-
-        chunk_size = 10
-        for i in range(0, total_rules_in_file, chunk_size):
-          chunk = parsed_rules[i : i + chunk_size]
-          end_idx = min(i + chunk_size, total_rules_in_file)
-
-          status_text.info(
-              f"📄 **[{file_idx+1}/{total_files}] {file_name}** を処理中..."
-              f" ({i+1}〜{end_idx} / 全{total_rules_in_file}件)"
-          )
-
-          chunk_summaries = summarize_chunk_with_gemini(chunk, gemini_api_key)
-          all_summaries.update(chunk_summaries)
-
-        # 要約組み込み
-        updated_content = header
-        for r in parsed_rules:
-          summary_text = all_summaries.get(
-              r["title"], "（要約生成エラー：一時的な混雑または出力不可）"
-          )
-          formatted_summary = "> " + summary_text.replace("\n", "\n> ")
-          updated_content += (
-              f"## {r['title']}\n\n> **【概要・要約】**\n{formatted_summary}\n\n{r['body']}"
-          )
-
-        st.session_state.updated_md_dict[file_name] = updated_content
-        progress_bar.progress((file_idx + 1) / total_files)
-
-      status_text.empty()
-      st.success("🎉 選択した編の要約生成が完了しました！")
-
-# --- ステップ3: 要約済みMarkdownのダウンロード ---
-if st.session_state.updated_md_dict:
-  st.divider()
-  st.header("3. 要約付きMarkdownファイルのダウンロード")
-
-  preview_file = st.selectbox(
-      "要約完了ファイルを選択:",
-      sorted(list(st.session_state.updated_md_dict.keys())),
-  )
-
-  col1, col2 = st.columns(2)
-
-  with col1:
-    if preview_file:
-      st.download_button(
-          label=f"📥 要約済み {preview_file} をダウンロード",
-          data=st.session_state.updated_md_dict[preview_file],
-          file_name=f"summary_{preview_file}",
-          mime="text/markdown",
-      )
-
-  with col2:
-    zip_buffer = io.BytesIO()
-    with zipfile.ZipFile(zip_buffer, "w") as zf:
-      for fname, fcontent in st.session_state.updated_md_dict.items():
-        zf.writestr(fname, fcontent)
-
-    st.download_button(
-        label="📦 要約完了ファイルをまとめてZIPダウンロード",
-        data=zip_buffer.getvalue(),
-        file_name="summarized_13_hens.zip",
-        mime="application/zip",
-    )
-
-  if preview_file:
-    with st.expander("👁️ 要約済みプレビュー（先頭2,000文字）"):
-      st.text(st.session_state.updated_md_dict[preview_file][:2000] + "\n...")
+st.header("1. DVDデータ（ZIPファイル）の
