@@ -1,5 +1,6 @@
 import io
 import re
+import time
 import zipfile
 from bs4 import BeautifulSoup
 from google import genai
@@ -20,13 +21,12 @@ gemini_api_key = st.secrets.get("GEMINI_API_KEY", "")
 
 # --- Geminiによる例規ごとの要約生成関数 ---
 def generate_summary_with_gemini(
-    title: str, content: str, api_key: str
+    title: str, content: str, api_key: str, model_name: str = "gemini-3.8-flash"
 ) -> str:
-    """Gemini を使用して例規ごとの要約を生成"""
+    """Gemini を使用して例規ごとの要約を生成（API過負荷防止・自動リトライ付き）"""
     if not api_key:
         return "・（APIキー未設定のため要約スキップ）"
 
-    # 長すぎる本文を一定文字数に制限（トークン節約および応答速度向上のため）
     trimmed_content = content[:2500].strip()
 
     prompt = f"""
@@ -42,17 +42,27 @@ def generate_summary_with_gemini(
 本文:
 {trimmed_content}
 """
-    try:
-        client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(
-            model="gemini-3.8-flash",
-            contents=prompt,
-        )
-        return response.text.strip()
-    except Exception as e:
-        st.warning(f"Gemini API（要約生成）でエラー ({title}): {e}")
-        return "・（要約生成エラーが発生しました）"
+    # 連続アクセスによる503エラー防止のため、呼び出し前に0.5秒待機
+    time.sleep(0.5)
 
+    max_retries = 3  # 万が一503が発生した場合の自動リトライ
+    client = genai.Client(api_key=api_key)
+
+    for attempt in range(max_retries):
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+            )
+            return response.text.strip()
+        except Exception as e:
+            if attempt < max_retries - 1:
+                # 混雑時は待機時間を伸ばして再試行（3秒、6秒...）
+                time.sleep(3 * (attempt + 1))
+                continue
+            else:
+                st.warning(f"Gemini API（要約生成）でエラー ({title}): {e}")
+                return "・（要約生成エラーが発生しました）"
 
 # --- 単一のMarkdownファイル内の全例規に要約を付与する関数 ---
 def process_markdown_summaries(
