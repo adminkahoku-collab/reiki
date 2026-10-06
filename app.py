@@ -1,6 +1,7 @@
 import io
 import re
 import time
+import json
 import zipfile
 from bs4 import BeautifulSoup
 from google import genai
@@ -19,68 +20,78 @@ password = st.sidebar.text_input("職員用パスワード", type="password")
 gemini_api_key = st.secrets.get("GEMINI_API_KEY", "")
 
 
-# --- Geminiによる例規ごとの要約生成関数 ---
-def generate_summary_with_gemini(
-    title: str, content: str, api_key: str, model_name: str = "gemini-3.8-flash"
-) -> str:
-    """Gemini を使用して例規ごとの要約を生成（API過負荷防止・自動リトライ付き）"""
+# --- Geminiによる複数例規の一括要約生成関数（バッチ処理） ---
+def generate_batch_summaries_with_gemini(
+    rules_batch: list, api_key: str, model_name: str = "gemini-3.8-flash"
+) -> dict:
+    """
+    複数（30〜40件）の例規を1回のリクエストで一括要約し、JSON形式で返却する関数
+    rules_batch: [{'title': title, 'content': content}, ...]
+    """
     if not api_key:
-        return "・（APIキー未設定のため要約スキップ）"
+        return {item["title"]: "・（APIキー未設定のため要約スキップ）" for item in rules_batch}
 
-    trimmed_content = content[:2500].strip()
-
-    prompt = f"""
+    # 一括処理用のプロンプト構築
+    prompt = """
 あなたは自治体職員向けの例規要約アシスタントです。
-以下の例規の本文を読み、主要なポイントや対象者、重要な手続きを箇条書きで3行程度で簡潔に要約してください。
+以下に複数の例規（タイトルと本文）を提示します。
+それぞれの例規について、主要なポイントや対象者、重要な手続きを箇条書きで3行程度で簡潔に要約してください。
 
 【出力条件】
-- 必ず箇条書き（・）で3点以内にまとめてください。
-- タイトルや挨拶、前置き（例:「以下は要約です」など）は含めず、箇条書き本文のみを出力してください。
+- 出力は必ず以下のJSONオブジェクト形式のみとし、マークダウンのコードブロック(```json ... ```)を含めてください。
+- 各例規の「タイトル」をキーとし、値として箇条書き（・）で3点以内にまとめた要約文字列を設定してください。
+- 挨拶や前置き、解説などは一切出力しないでください。
 
-【対象例規】
-タイトル: {title}
-本文:
-{trimmed_content}
+【出力フォーマット例】
+{
+  "○○条例": "・要約1行目\\n・要約2行目\\n・要約3行目",
+  "○○規則": "・要約1行目\\n・要約2行目"
+}
+
+【対象例規リスト】
 """
-    # 連続アクセスによる503エラー防止のため、呼び出し前に0.5秒待機
-    time.sleep(0.5)
+    for idx, item in enumerate(rules_batch, 1):
+        trimmed = item["content"][:2000].strip()
+        prompt += f"\n--- 例規{idx} ---\nタイトル: {item['title']}\n本文:\n{trimmed}\n"
 
-    max_retries = 3  # 万が一503が発生した場合の自動リトライ
+    time.sleep(1.0) # API連続アクセス緩和
     client = genai.Client(api_key=api_key)
+    max_retries = 3
 
     for attempt in range(max_retries):
         try:
             response = client.models.generate_content(
                 model=model_name,
                 contents=prompt,
+                config={"response_mime_type": "application/json"}  # JSON出力モードの指定
             )
-            return response.text.strip()
+            # レスポンスのJSONパース
+            result_json = json.loads(response.text.strip())
+            return result_json
         except Exception as e:
             if attempt < max_retries - 1:
-                # 混雑時は待機時間を伸ばして再試行（3秒、6秒...）
-                time.sleep(3 * (attempt + 1))
+                time.sleep(4 * (attempt + 1))
                 continue
             else:
-                st.warning(f"Gemini API（要約生成）でエラー ({title}): {e}")
-                return "・（要約生成エラーが発生しました）"
+                st.warning(f"一括要約生成でエラーが発生しました: {e}")
+                # エラー時は空辞書を返却（スキップ用）
+                return {}
 
-# --- 単一のMarkdownファイル内の全例規に要約を付与する関数 ---
+# --- バッチ処理対応版：Markdown全体の要約挿入関数 ---
 def process_markdown_summaries(
-    md_text: str, api_key: str, progress_callback=None
+    md_text: str, api_key: str, progress_callback=None, batch_size: str = 35
 ) -> str:
-    """Markdownファイル全体を解析し、各例規の見出し直下に要約ブロックを挿入する"""
-    # 例規ごとに分割（"---" 区切り、または "## " で区切られている構造に対応）
+    """Markdown全体を解析し、35件ごとに一括でGeminiへ要約リクエストを送信して埋め込む"""
     sections = md_text.split("\n\n---\n\n")
-    processed_sections = []
+    parsed_sections = []
+    rules_to_process = []
 
-    total_sections = len(sections)
-
+    # 1. 各セクションの構造解析
     for idx, sec in enumerate(sections):
         sec_str = sec.strip()
         if not sec_str:
             continue
 
-        # "## " で始まる見出しを探す
         lines = sec_str.splitlines()
         rule_title = None
         title_line_idx = -1
@@ -91,43 +102,62 @@ def process_markdown_summaries(
                 title_line_idx = i
                 break
 
-        # 見出しが存在し、本文がある場合のみ要約を生成
         if rule_title and title_line_idx != -1:
             body_lines = lines[title_line_idx + 1 :]
             body_text = "\n".join(body_lines).strip()
-
-            # 本文が存在する場合に要約処理を実施
             if body_text:
-                summary = generate_summary_with_gemini(
-                    rule_title, body_text, api_key
-                )
-
-                # 引用ブロック（>）形式で概要・要約を整形
-                summary_block = "> **【概要・要約】**\n" + "\n".join(
-                    [
-                        f"> {line}"
-                        for line in summary.splitlines()
-                        if line.strip()
-                    ]
-                )
-
-                # 見出しの直下に要約ブロックを挿入
-                new_sec = (
-                    "\n".join(lines[: title_line_idx + 1])
-                    + "\n\n"
-                    + summary_block
-                    + "\n\n"
-                    + "\n".join(lines[title_line_idx + 1 :])
-                )
-                processed_sections.append(new_sec)
+                parsed_sections.append({
+                    "is_rule": True,
+                    "title": rule_title,
+                    "lines": lines,
+                    "title_idx": title_line_idx,
+                    "body": body_text
+                })
+                rules_to_process.append({
+                    "title": rule_title,
+                    "content": body_text
+                })
             else:
-                processed_sections.append(sec_str)
+                parsed_sections.append({"is_rule": False, "raw": sec_str})
         else:
-            # ## 見出しがないセクション（ファイル冒頭の # 01_第１編 総規 など）
-            processed_sections.append(sec_str)
+            parsed_sections.append({"is_rule": False, "raw": sec_str})
+
+    # 2. 35件ずつのバッチに分けて Gemini API を呼び出し
+    summaries_dict = {}
+    total_rules = len(rules_to_process)
+
+    for i in range(0, total_rules, batch_size):
+        batch = rules_to_process[i:i + batch_size]
+        batch_results = generate_batch_summaries_with_gemini(batch, api_key)
+        summaries_dict.update(batch_results)
 
         if progress_callback:
-            progress_callback(idx + 1, total_sections)
+            progress_callback(min(i + batch_size, total_rules), total_rules)
+
+    # 3. 生成された要約をMarkdown形式へ再構築
+    processed_sections = []
+    for item in parsed_sections:
+        if not item["is_rule"]:
+            processed_sections.append(item["raw"])
+            continue
+
+        title = item["title"]
+        lines = item["lines"]
+        t_idx = item["title_idx"]
+        summary = summaries_dict.get(title, "・（要約生成スキップ）")
+
+        summary_block = "> **【概要・要約】**\n" + "\n".join(
+            [f"> {line}" for line in summary.splitlines() if line.strip()]
+        )
+
+        new_sec = (
+            "\n".join(lines[: t_idx + 1])
+            + "\n\n"
+            + summary_block
+            + "\n\n"
+            + "\n".join(lines[t_idx + 1 :])
+        )
+        processed_sections.append(new_sec)
 
     return "\n\n---\n\n".join(processed_sections)
 
