@@ -64,19 +64,16 @@ def summarize_chunk_with_gemini(
         res_text = re.sub(r"^```\s*", "", res_text)
         res_text = re.sub(r"\s*```$", "", res_text)
 
-        # 4.5秒待機（無料枠制限: 15 RPM 対策）
+        # 無料枠制限(15 RPM)対策のウェイト
         time.sleep(4.5)
 
-        # JSONテキストを辞書型に変換して返却
         return json.loads(res_text)
 
       except Exception as e:
         err_str = str(e)
-        # 503混雑エラーや429レート制限エラー時はリトライ
         if "503" in err_str or "429" in err_str or "UNAVAILABLE" in err_str:
           time.sleep(8 * (attempt + 1))
           continue
-        # その他のエラーの場合はモデルを切り替える
         break
 
   return {}
@@ -90,14 +87,15 @@ st.set_page_config(
     page_title="例規集要約付与ツール", page_icon="📜", layout="wide"
 )
 
-st.title("📜 自治体例規集 自動要約付与ツール")
+st.title("📜 自治体例規集 自動要約付与ツール (Cloud版)")
 st.markdown(
     "13編のMarkdownファイルを取り込み、10件ずつの安全な一括処理でGemini"
     " APIを用いて要約を生成・追加します。"
 )
 
-# APIキーの取得（st.secrets または サイドバー入力）
+# APIキーの取得（st.secrets 優先、なければサイドバー入力）
 gemini_api_key = st.secrets.get("GEMINI_API_KEY", "")
+
 with st.sidebar:
   st.header("⚙️ 設定")
   if not gemini_api_key:
@@ -106,40 +104,34 @@ with st.sidebar:
     )
 
   st.divider()
-  st.markdown("### 📌 処理仕様")
-  st.caption("・1編あたり10件ずつチャンク化してAPIへ送信")
-  st.caption("・応答途切れ（出力上限）を回避")
-  st.caption("・無料枠制限（15 RPM）を遵守したウェイト処理込み")
+  st.markdown("### 💡 クラウド版運用のコツ")
+  st.caption("通信切断（タイムアウト）を防ぐため、**1編ずつ選択して処理**")
+  st.caption("＆ダウンロードを推奨します。")
 
 if not gemini_api_key:
   st.warning(
-      "👈 サイドバーから Gemini API Key を設定してください（または .streamlit/secrets.toml"
-      " に記述）。"
+      "👈 サイドバーから Gemini API Key を設定してください（または Secrets"
+      " に登録）。"
   )
   st.stop()
 
 # セッション状態の保持
 if "md_dict" not in st.session_state:
-  st.session_state.md_dict = {}  # 元のMarkdownデータ { ファイル名: 本文 }
+  st.session_state.md_dict = {}
 if "updated_md_dict" not in st.session_state:
-  st.session_state.updated_md_dict = (
-      {}
-  )  # 要約付与後のMarkdownデータ { ファイル名: 本文 }
+  st.session_state.updated_md_dict = {}
 
 # --- ステップ1: ファイルアップロード ---
 st.header("1. 例規Markdownファイル（全13編）の読み込み")
 uploaded_files = st.file_uploader(
-    "13編のMarkdown（.md）ファイルをまとめて選択・ドラッグ＆ドロップしてください",
+    "13編のMarkdown（.md）ファイルをドラッグ＆ドロップしてください",
     type=["md"],
     accept_multiple_files=True,
 )
 
 if uploaded_files:
-  # ファイル名で並び替え（01_総務編.md などを順序通りに並べる）
   sorted_files = sorted(uploaded_files, key=lambda x: x.name)
-
   for uploaded_file in sorted_files:
-    # UTF-8で読み込み
     string_data = uploaded_file.getvalue().decode("utf-8")
     st.session_state.md_dict[uploaded_file.name] = string_data
 
@@ -152,15 +144,17 @@ if st.session_state.md_dict:
   st.divider()
   st.header("2. 要約付与処理の実行")
 
-  # 処理モード選択
   run_mode = st.radio(
       "処理モードを選択してください:",
-      ["全ファイル（全編）を一括処理する", "選択したファイルのみ処理する"],
+      [
+          "選択したファイルのみ処理する（推奨: タイムアウト防止）",
+          "全ファイル（全編）を一括処理する",
+      ],
       horizontal=True,
   )
 
   selected_keys = []
-  if run_mode == "選択したファイルのみ処理する":
+  if "選択したファイル" in run_mode:
     selected_keys = st.multiselect(
         "処理対象の編ファイルを選択してください:",
         list(st.session_state.md_dict.keys()),
@@ -178,11 +172,9 @@ if st.session_state.md_dict:
     for file_idx, file_name in enumerate(selected_keys):
       content = st.session_state.md_dict[file_name]
 
-      # "## " で区切って各例規ブロックを分解
       rules_raw = content.split("## ")
-      header = rules_raw[0]  # ファイル先頭のヘッダー情報
+      header = rules_raw[0]
 
-      # 構造化データ（タイトルと本文）の抽出
       parsed_rules = []
       for block in rules_raw[1:]:
         lines = block.split("\n")
@@ -193,53 +185,44 @@ if st.session_state.md_dict:
       total_rules_in_file = len(parsed_rules)
       all_summaries = {}
 
-      # 10件ずつのグループ（チャンク）にしてAPI送信
       chunk_size = 10
       for i in range(0, total_rules_in_file, chunk_size):
         chunk = parsed_rules[i : i + chunk_size]
         end_idx = min(i + chunk_size, total_rules_in_file)
 
+        # 画面に細かく進捗を表示して通信タイムアウトを防ぐ
         status_text.info(
             f"📄 **[{file_idx+1}/{total_files}] {file_name}** を処理中..."
             f" ({i+1}〜{end_idx} / 全{total_rules_in_file}件)"
         )
 
-        # Gemini APIを呼び出して10件まとめて要約を取得
         chunk_summaries = summarize_chunk_with_gemini(chunk, gemini_api_key)
         all_summaries.update(chunk_summaries)
 
-      # 元のMarkdown構造へ要約を挿入して再組み上げ
+      # 組み立て
       updated_content = header
       for r in parsed_rules:
-        # API返却値からタイトルに一致する要約を取得（取得失敗時のフォールバック設定）
         summary_text = all_summaries.get(
             r["title"], "（要約生成エラー：一時的な混雑または出力不可）"
         )
-
-        # Markdown引用記号（> ）を付与して整形
         formatted_summary = "> " + summary_text.replace("\n", "\n> ")
-
         updated_content += (
             f"## {r['title']}\n\n> **【概要・要約】**\n{formatted_summary}\n\n{r['body']}"
         )
 
-      # 処理結果をセッション領域に保存
       st.session_state.updated_md_dict[file_name] = updated_content
-
-      # プログレスバーの更新
       progress_bar.progress((file_idx + 1) / total_files)
 
     status_text.empty()
-    st.success("🎉 指定したすべてのファイルの要約付与処理が完了しました！")
+    st.success("🎉 指定したファイルの要約付与処理が完了しました！")
 
 # --- ステップ3: 結果のプレビューとダウンロード ---
 if st.session_state.updated_md_dict:
   st.divider()
   st.header("3. 処理結果の確認とダウンロード")
 
-  # プレビュー表示用ファイルの選択
   preview_file = st.selectbox(
-      "結果を表示するファイルを選択してください:",
+      "ダウンロード・確認するファイルを選択してください:",
       list(st.session_state.updated_md_dict.keys()),
   )
 
