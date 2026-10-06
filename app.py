@@ -49,7 +49,7 @@ def parse_reiki_html(html_content: str) -> tuple[str, str]:
 
 
 def extract_13_hens_from_zip(zip_file_bytes) -> dict[str, str]:
-  """bunya_00100000.html を起点にして、13編の構造通りに例規(H*****_J.html)を集約する"""
+  """bunya_0010000.html を起点にして、13編の構造通りに例規(H*****_J.html)を集約する"""
   md_dict = {}
 
   with zipfile.ZipFile(io.BytesIO(zip_file_bytes)) as z:
