@@ -37,7 +37,7 @@ def parse_reiki_html(html_content: str) -> tuple[str, str]:
   for tag in soup(["script", "style", "nav", "header", "footer", "iframe"]):
     tag.decompose()
 
-  # 本文抽出（honbun ID または body 全体）
+  # 本文抽出
   body_element = soup.find("div", id="honbun") or soup.find("body") or soup
   body_text = body_element.get_text()
 
@@ -48,26 +48,26 @@ def parse_reiki_html(html_content: str) -> tuple[str, str]:
   return title, body_text
 
 
+def resolve_path(base_path: str, href: str) -> str:
+  """相対パスをZIP内の標準化パスに変換"""
+  base_dir = os.path.dirname(base_path)
+  joined = os.path.join(base_dir, href)
+  return os.path.normpath(joined).replace("\\", "/")
+
+
 def extract_13_hens_from_zip(zip_file_bytes) -> dict[str, str]:
-  """bunya_0010000.html を起点にして、13編の構造通りに例規(H*****_J.html)を集約する"""
+  """bunya_00100000.html を起点に、中分類・小分類リンクを含めて13編の例規(H*****_J.html)を集約する"""
   md_dict = {}
 
   with zipfile.ZipFile(io.BytesIO(zip_file_bytes)) as z:
-    file_list = z.namelist()
+    file_map = {f.lower().replace("\\", "/"): f for f in z.namelist()}
 
-    # 1. 目次ファイル (bunya_00100000.html) のパスを検索
+    # 1. 目次ファイル (bunya_00100000.html) のパスを特定
     bunya_path = None
-    for f in file_list:
-      if os.path.basename(f).lower() == "bunya_00100000.html":
-        bunya_path = f
+    for norm_f, raw_f in file_map.items():
+      if os.path.basename(norm_f) == "bunya_00100000.html":
+        bunya_path = raw_f
         break
-
-    # フォールバック: 見つからない場合は bunya_ から始まる目次を検索
-    if not bunya_path:
-      for f in file_list:
-        if "bunya_" in os.path.basename(f).lower() and f.endswith(".html"):
-          bunya_path = f
-          break
 
     if not bunya_path:
       st.error(
@@ -75,106 +75,105 @@ def extract_13_hens_from_zip(zip_file_bytes) -> dict[str, str]:
       )
       return {}
 
-    # 2. 目次HTMLをデコードしてパース
-    bunya_bytes = z.read(bunya_path)
-    try:
-      bunya_html = bunya_bytes.decode("cp932")
-    except UnicodeDecodeError:
-      bunya_html = bunya_bytes.decode("utf-8", errors="ignore")
+    # HTML読み込みヘルパー
+    def read_html_soup(zip_path: str):
+      try:
+        data = z.read(zip_path)
+        try:
+          html_str = data.decode("cp932")
+        except UnicodeDecodeError:
+          html_str = data.decode("utf-8", errors="ignore")
+        return BeautifulSoup(html_str, "html.parser")
+      except Exception:
+        return None
 
-    soup_bunya = BeautifulSoup(bunya_html, "html.parser")
+    # 2. トップ目次から13編のルート領域と中分類リンクを取得
+    soup_top = read_html_soup(bunya_path)
+    if not soup_top:
+      return {}
 
-    # 目次内のリンク構造を解析（13編の定義を抽出）
-    # 一般的な例規システムでは <ul> や <table> で第1編〜第13編がリンク定義されています
-    hen_structure = (
-        {}
-    )  # { "第01編_総務": ["path/H1234_J.html", ...], ... }
+    hen_structure = {}  # { "第01編_〇〇": ["H1234_J.html のフルパス", ...], ... }
+    current_hen = "第01編_未分類"
 
-    # リンクおよびリスト要素の解析
-    current_hen_name = "第01編_未分類"
-    bunya_dir = os.path.dirname(bunya_path)
-
-    # リンク要素 (aタグ) を追跡
-    a_tags = soup_bunya.find_all("a")
-
-    for a in a_tags:
+    # 目次内のすべての <a> タグを順に走査
+    for a in soup_top.find_all("a"):
       text = a.get_text(strip=True)
       href = a.get("href", "")
-
-      if not href:
+      if not href or href.startswith("#") or href.startswith("javascript:"):
         continue
 
-      # 編のタイトルヘッダー等の判定（例: "第1編", "第01編", "第１編" 等）
-      hen_match = re.search(r"(第\s*[0-9０-９1-13]{1,2}\s*編[^\s]*)", text)
-      if hen_match:
-        current_hen_name = hen_match.group(1)
-        if current_hen_name not in hen_structure:
-          hen_structure[current_hen_name] = []
-        continue
-
-      # 例規ファイル (H*****_J.html) へのリンク判定
-      if re.search(r"H\d+.*\.html?", href, re.IGNORECASE):
-        # 相対パスをZIP内のフルパスへ変換
-        norm_path = os.path.normpath(os.path.join(bunya_dir, href)).replace(
-            "\\", "/"
-        )
-
-        if current_hen_name not in hen_structure:
-          hen_structure[current_hen_name] = []
-
-        if norm_path not in hen_structure[current_hen_name]:
-          hen_structure[current_hen_name].append(norm_path)
-
-    # もし目次解析でリンクが十分に拾えなかった場合の補完処理（直接ZIP内の H*****_J.html を収集）
-    if not hen_structure:
-      st.warning(
-          "目次からの自動リンク解析が困難だったため、全例規ファイル(H*****_J.html)から再構築します。"
+      # 編の切り替わり判定（"第1編", "第01編", "第１編" 等）
+      hen_match = re.search(
+          r"(第\s*[0-9０-９1-13]{1,2}\s*編[^\s＜＜＜<]*)"
+          , text
       )
-      all_reiki_files = [
-          f
-          for f in file_list
-          if re.search(r"H\d+.*\.html?", os.path.basename(f), re.IGNORECASE)
-      ]
+      if hen_match:
+        current_hen = hen_match.group(1).replace(" ", "")
+        if current_hen not in hen_structure:
+          hen_structure[current_hen] = []
 
-      # 13等分して13編のMarkdownとして仮展開
-      chunk_len = max(1, len(all_reiki_files) // 13)
-      for i in range(13):
-        h_name = f"第{i+1:02d}編"
-        hen_structure[h_name] = all_reiki_files[
-            i * chunk_len : (i + 1) * chunk_len
-            if i < 12
-            else len(all_reiki_files)
-        ]
+      # リンク先が例規本文(H*****_J.html)または中分類(bunya_*.html等)の場合
+      target_rel_path = resolve_path(bunya_path, href)
+      target_key = target_rel_path.lower()
 
-    # 3. 抽出した編・例規パス情報から13編のMarkdownを組み立て
+      if target_key in file_map:
+        real_target_path = file_map[target_key]
+
+        # 例規本文HTMLの場合
+        if re.search(r"H\d+.*_J\.html?$", real_target_path, re.IGNORECASE):
+          if current_hen not in hen_structure:
+            hen_structure[current_hen] = []
+          if real_target_path not in hen_structure[current_hen]:
+            hen_structure[current_hen].append(real_target_path)
+
+        # 中分類・小分類HTMLの場合（再帰的に辿ってH*****_J.htmlを回収）
+        elif real_target_path.endswith(".html") or real_target_path.endswith(
+            ".htm"
+        ):
+          soup_sub = read_html_soup(real_target_path)
+          if soup_sub:
+            for sub_a in soup_sub.find_all("a"):
+              sub_href = sub_a.get("href", "")
+              if not sub_href:
+                continue
+              h_rel_path = resolve_path(real_target_path, sub_href)
+              h_key = h_rel_path.lower()
+
+              if (
+                  h_key in file_map
+                  and re.search(
+                      r"H\d+.*_J\.html?$", file_map[h_key], re.IGNORECASE
+                  )
+              ):
+                if current_hen not in hen_structure:
+                  hen_structure[current_hen] = []
+                if file_map[h_key] not in hen_structure[current_hen]:
+                  hen_structure[current_hen].append(file_map[h_key])
+
+    # 3. 各編のMarkdownファイルを構築
     for idx, (hen_name, html_paths) in enumerate(
         sorted(hen_structure.items()), 1
     ):
       if not html_paths:
         continue
 
-      formatted_hen_name = f"第{idx:02d}編_{hen_name.replace('第', '').replace('編', '')}"
+      # ディレクトリ名・ファイル名用の正規化
+      clean_name = re.sub(r"^第\d+編", "", hen_name).strip("_ ")
+      formatted_hen_name = (
+          f"第{idx:02d}編_{clean_name}" if clean_name else f"第{idx:02d}編"
+      )
+
       md_content = f"# {formatted_hen_name}\n\n"
 
-      for path in html_paths:
-        # ZIP内に該当ファイルが存在するか確認
-        real_path = None
-        for file_in_zip in file_list:
-          if file_in_zip.lower() == path.lower() or os.path.basename(
-              file_in_zip
-          ).lower() == os.path.basename(path).lower():
-            real_path = file_in_zip
-            break
+      for real_path in html_paths:
+        file_bytes = z.read(real_path)
+        try:
+          html_str = file_bytes.decode("cp932")
+        except UnicodeDecodeError:
+          html_str = file_bytes.decode("utf-8", errors="ignore")
 
-        if real_path:
-          file_bytes = z.read(real_path)
-          try:
-            html_str = file_bytes.decode("cp932")
-          except UnicodeDecodeError:
-            html_str = file_bytes.decode("utf-8", errors="ignore")
-
-          title, body = parse_reiki_html(html_str)
-          md_content += f"## {title}\n\n{body}\n\n---\n\n"
+        title, body = parse_reiki_html(html_str)
+        md_content += f"## {title}\n\n{body}\n\n---\n\n"
 
       md_dict[f"{formatted_hen_name}.md"] = md_content
 
@@ -301,7 +300,7 @@ if uploaded_zip:
       or st.session_state.loaded_zip_name != uploaded_zip.name
   ):
     with st.spinner(
-        "bunya_00100000.html（目次）を解析し、13編の例規データ(H*****_J.html)を集約中..."
+        "bunya_00100000.html（目次）の階層構造を解析し、13編の例規データ(H*****_J.html)を集約中..."
     ):
       st.session_state.md_dict = extract_13_hens_from_zip(
           uploaded_zip.getvalue()
@@ -310,12 +309,12 @@ if uploaded_zip:
 
   if st.session_state.md_dict:
     st.success(
-        f"✅ 目次構造のパースが完了しました！ **合計 {len(st.session_state.md_dict)} 件の編（Markdownファイル）**"
+        f"✅ 目次解析完了！ **合計 {len(st.session_state.md_dict)} 件の編（Markdownファイル）**"
         " に正しく分割・作成されました。"
     )
 
     # 13編の分割結果一覧
-    with st.expander("📋 作成された13編のMarkdownファイル一覧を確認"):
+    with st.expander("📋 作成されたMarkdownファイル一覧を確認"):
       for fname in sorted(st.session_state.md_dict.keys()):
         rule_count = st.session_state.md_dict[fname].count("\n## ")
         st.write(f"- **{fname}**（収録例規数: 約 {rule_count} 件）")
