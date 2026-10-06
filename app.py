@@ -56,7 +56,7 @@ def resolve_path(base_path: str, href: str) -> str:
 
 
 def extract_13_hens_from_zip(zip_file_bytes) -> dict[str, str]:
-  """bunya_00100000.html を起点に、中分類・小分類リンクを含めて13編の例規(H*****_J.html)を集約する"""
+  """bunya_0010000.html を起点に、中分類・小分類リンクを含めて13編の例規(H*****_J.html)を集約する"""
   md_dict = {}
 
   with zipfile.ZipFile(io.BytesIO(zip_file_bytes)) as z:
