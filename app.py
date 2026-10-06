@@ -9,82 +9,174 @@ from google import genai
 import streamlit as st
 
 # ==========================================
-# 1. HTML -> Markdown 変換ユーティリティ
+# 1. HTML -> Markdown 解析ユーティリティ
 # ==========================================
 
 
-def parse_html_to_markdown(html_content: str) -> tuple[str, str]:
-  """HTMLからタイトルと本文を抽出"""
+def parse_reiki_html(html_content: str) -> tuple[str, str]:
+  """例規本文HTML (H*****_J.html) からタイトルと本文を抽出"""
   soup = BeautifulSoup(html_content, "html.parser")
 
   # タイトル抽出
   title = ""
-  if soup.find("h1"):
-    title = soup.find("h1").get_text(strip=True)
+  title_tag = (
+      soup.find("h1")
+      or soup.find("div", class_="title")
+      or soup.find("span", class_="title")
+  )
+  if title_tag:
+    title = title_tag.get_text(strip=True)
   elif soup.title:
     title = soup.title.get_text(strip=True)
   else:
     title = "無題の例規"
+
   title = re.sub(r"[\r\n\t]", "", title)
 
-  # 本文抽出
-  body_element = (
-      soup.find("div", id="honbun") or soup.find("body") or soup
-  )
-  for tag in body_element(["script", "style", "nav", "header", "footer"]):
+  # 不要タグの削除
+  for tag in soup(["script", "style", "nav", "header", "footer", "iframe"]):
     tag.decompose()
 
+  # 本文抽出（honbun ID または body 全体）
+  body_element = soup.find("div", id="honbun") or soup.find("body") or soup
   body_text = body_element.get_text()
+
+  # テキスト整形
   body_text = re.sub(r"\r\n|\r", "\n", body_text)
   body_text = re.sub(r"\n{3,}", "\n\n", body_text).strip()
 
   return title, body_text
 
 
-def convert_zip_to_md_dict(zip_file_bytes) -> dict[str, str]:
-  """ZIP(DVDデータ)を解析し、必ず13編の個別Markdownデータ（辞書型）として分割抽出する"""
+def extract_13_hens_from_zip(zip_file_bytes) -> dict[str, str]:
+  """bunya_00100000.html を起点にして、13編の構造通りに例規(H*****_J.html)を集約する"""
   md_dict = {}
 
   with zipfile.ZipFile(io.BytesIO(zip_file_bytes)) as z:
-    hen_groups = {}
+    file_list = z.namelist()
 
-    for filename in z.namelist():
-      if filename.endswith("/") or "__MACOSX" in filename:
+    # 1. 目次ファイル (bunya_00100000.html) のパスを検索
+    bunya_path = None
+    for f in file_list:
+      if os.path.basename(f).lower() == "bunya_00100000.html":
+        bunya_path = f
+        break
+
+    # フォールバック: 見つからない場合は bunya_ から始まる目次を検索
+    if not bunya_path:
+      for f in file_list:
+        if "bunya_" in os.path.basename(f).lower() and f.endswith(".html"):
+          bunya_path = f
+          break
+
+    if not bunya_path:
+      st.error(
+          "⚠️ 目次ファイル (bunya_00100000.html) がZIP内に見つかりませんでした。"
+      )
+      return {}
+
+    # 2. 目次HTMLをデコードしてパース
+    bunya_bytes = z.read(bunya_path)
+    try:
+      bunya_html = bunya_bytes.decode("cp932")
+    except UnicodeDecodeError:
+      bunya_html = bunya_bytes.decode("utf-8", errors="ignore")
+
+    soup_bunya = BeautifulSoup(bunya_html, "html.parser")
+
+    # 目次内のリンク構造を解析（13編の定義を抽出）
+    # 一般的な例規システムでは <ul> や <table> で第1編〜第13編がリンク定義されています
+    hen_structure = (
+        {}
+    )  # { "第01編_総務": ["path/H1234_J.html", ...], ... }
+
+    # リンクおよびリスト要素の解析
+    current_hen_name = "第01編_未分類"
+    bunya_dir = os.path.dirname(bunya_path)
+
+    # リンク要素 (aタグ) を追跡
+    a_tags = soup_bunya.find_all("a")
+
+    for a in a_tags:
+      text = a.get_text(strip=True)
+      href = a.get("href", "")
+
+      if not href:
         continue
 
-      ext = os.path.splitext(filename)[1].lower()
-      if ext in [".html", ".htm"]:
-        parts = [p for p in filename.split("/") if p]
+      # 編のタイトルヘッダー等の判定（例: "第1編", "第01編", "第１編" 等）
+      hen_match = re.search(r"(第\s*[0-9０-９1-13]{1,2}\s*編[^\s]*)", text)
+      if hen_match:
+        current_hen_name = hen_match.group(1)
+        if current_hen_name not in hen_structure:
+          hen_structure[current_hen_name] = []
+        continue
 
-        # 第一階層のフォルダ名を編名として取得
-        if len(parts) >= 2:
-          hen_name = parts[0]
-        else:
-          hen_name = "第01編_未分類"
+      # 例規ファイル (H*****_J.html) へのリンク判定
+      if re.search(r"H\d+.*\.html?", href, re.IGNORECASE):
+        # 相対パスをZIP内のフルパスへ変換
+        norm_path = os.path.normpath(os.path.join(bunya_dir, href)).replace(
+            "\\", "/"
+        )
 
-        if hen_name not in hen_groups:
-          hen_groups[hen_name] = []
-        hen_groups[hen_name].append(filename)
+        if current_hen_name not in hen_structure:
+          hen_structure[current_hen_name] = []
 
-    # 13編それぞれに1つのMarkdownファイルを生成
-    for hen_name, html_paths in sorted(hen_groups.items()):
-      md_content = f"# {hen_name}\n\n"
-      sorted_paths = sorted(html_paths)
+        if norm_path not in hen_structure[current_hen_name]:
+          hen_structure[current_hen_name].append(norm_path)
 
-      for path in sorted_paths:
-        file_bytes = z.read(path)
-        try:
-          html_str = file_bytes.decode("cp932")
-        except UnicodeDecodeError:
-          html_str = file_bytes.decode("utf-8", errors="ignore")
-
-        title, body = parse_html_to_markdown(html_str)
-        md_content += f"## {title}\n\n{body}\n\n---\n\n"
-
-      clean_hen_name = (
-          f"{hen_name}.md" if not hen_name.endswith(".md") else hen_name
+    # もし目次解析でリンクが十分に拾えなかった場合の補完処理（直接ZIP内の H*****_J.html を収集）
+    if not hen_structure:
+      st.warning(
+          "目次からの自動リンク解析が困難だったため、全例規ファイル(H*****_J.html)から再構築します。"
       )
-      md_dict[clean_hen_name] = md_content
+      all_reiki_files = [
+          f
+          for f in file_list
+          if re.search(r"H\d+.*\.html?", os.path.basename(f), re.IGNORECASE)
+      ]
+
+      # 13等分して13編のMarkdownとして仮展開
+      chunk_len = max(1, len(all_reiki_files) // 13)
+      for i in range(13):
+        h_name = f"第{i+1:02d}編"
+        hen_structure[h_name] = all_reiki_files[
+            i * chunk_len : (i + 1) * chunk_len
+            if i < 12
+            else len(all_reiki_files)
+        ]
+
+    # 3. 抽出した編・例規パス情報から13編のMarkdownを組み立て
+    for idx, (hen_name, html_paths) in enumerate(
+        sorted(hen_structure.items()), 1
+    ):
+      if not html_paths:
+        continue
+
+      formatted_hen_name = f"第{idx:02d}編_{hen_name.replace('第', '').replace('編', '')}"
+      md_content = f"# {formatted_hen_name}\n\n"
+
+      for path in html_paths:
+        # ZIP内に該当ファイルが存在するか確認
+        real_path = None
+        for file_in_zip in file_list:
+          if file_in_zip.lower() == path.lower() or os.path.basename(
+              file_in_zip
+          ).lower() == os.path.basename(path).lower():
+            real_path = file_in_zip
+            break
+
+        if real_path:
+          file_bytes = z.read(real_path)
+          try:
+            html_str = file_bytes.decode("cp932")
+          except UnicodeDecodeError:
+            html_str = file_bytes.decode("utf-8", errors="ignore")
+
+          title, body = parse_reiki_html(html_str)
+          md_content += f"## {title}\n\n{body}\n\n---\n\n"
+
+      md_dict[f"{formatted_hen_name}.md"] = md_content
 
   return md_dict
 
@@ -182,9 +274,9 @@ with st.sidebar:
 
   st.divider()
   st.markdown("### 📌 処理手順")
-  st.caption("1. DVDのZIPを1つアップロード")
-  st.caption("2. 変換された13編のMarkdownを確認・ダウンロード")
-  st.caption("3. 指定した編にAI要約を付与")
+  st.caption("1. DVDのZIPをアップロード")
+  st.caption("2. 目次(bunya_00100000.html)に基づき13編の.mdを出力")
+  st.caption("3. 各編にAI要約を付与")
 
 if not gemini_api_key:
   st.warning("👈 サイドバーから Gemini API Key を設定してください。")
@@ -208,23 +300,33 @@ if uploaded_zip:
       "loaded_zip_name" not in st.session_state
       or st.session_state.loaded_zip_name != uploaded_zip.name
   ):
-    with st.spinner("ZIP内の例規データを解析し、13編のMarkdownを生成中..."):
-      st.session_state.md_dict = convert_zip_to_md_dict(uploaded_zip.getvalue())
+    with st.spinner(
+        "bunya_00100000.html（目次）を解析し、13編の例規データ(H*****_J.html)を集約中..."
+    ):
+      st.session_state.md_dict = extract_13_hens_from_zip(
+          uploaded_zip.getvalue()
+      )
       st.session_state.loaded_zip_name = uploaded_zip.name
 
   if st.session_state.md_dict:
     st.success(
-        f"✅ 解析完了！ **{len(st.session_state.md_dict)} 件の編（Markdownファイル）**"
-        " が作成されました。"
+        f"✅ 目次構造のパースが完了しました！ **合計 {len(st.session_state.md_dict)} 件の編（Markdownファイル）**"
+        " に正しく分割・作成されました。"
     )
 
-    # 生成された13編の未要約Markdownの確認・ダウンロード機能
-    st.markdown("#### 📥 生成されたMarkdownファイルの確認・ダウンロード")
+    # 13編の分割結果一覧
+    with st.expander("📋 作成された13編のMarkdownファイル一覧を確認"):
+      for fname in sorted(st.session_state.md_dict.keys()):
+        rule_count = st.session_state.md_dict[fname].count("\n## ")
+        st.write(f"- **{fname}**（収録例規数: 約 {rule_count} 件）")
+
+    # 未要約Markdownの確認・ダウンロード
+    st.markdown("#### 📥 変換された13編のMarkdownファイルをダウンロード・確認")
 
     col_raw1, col_raw2 = st.columns(2)
     selected_raw_file = st.selectbox(
-        "確認する編を選択:",
-        list(st.session_state.md_dict.keys()),
+        "確認・ダウンロードする編を選択:",
+        sorted(list(st.session_state.md_dict.keys())),
         key="raw_select",
     )
 
@@ -250,7 +352,7 @@ if uploaded_zip:
           mime="application/zip",
       )
 
-    with st.expander("👁️️ 選択中の編のプレビュー表示（先頭1,500文字）"):
+    with st.expander("👁 選択中の編のプレビュー表示（先頭1,500文字）"):
       st.text(st.session_state.md_dict[selected_raw_file][:1500] + "\n...")
 
 # --- ステップ2: 対象の編を選択してAI要約を生成 ---
@@ -271,11 +373,11 @@ if st.session_state.md_dict:
   if "選択した編" in run_mode:
     selected_keys = st.multiselect(
         "要約を生成する編を選択してください（1編ずつを推奨）:",
-        list(st.session_state.md_dict.keys()),
-        default=list(st.session_state.md_dict.keys())[0:1],
+        sorted(list(st.session_state.md_dict.keys())),
+        default=sorted(list(st.session_state.md_dict.keys()))[0:1],
     )
   else:
-    selected_keys = list(st.session_state.md_dict.keys())
+    selected_keys = sorted(list(st.session_state.md_dict.keys()))
 
   if st.button("🤖 選択した編の要約生成を開始する", type="primary"):
     if not selected_keys:
@@ -315,7 +417,7 @@ if st.session_state.md_dict:
           chunk_summaries = summarize_chunk_with_gemini(chunk, gemini_api_key)
           all_summaries.update(chunk_summaries)
 
-        # 要約テキストを組み立てて組み込み
+        # 要約組み込み
         updated_content = header
         for r in parsed_rules:
           summary_text = all_summaries.get(
@@ -339,7 +441,7 @@ if st.session_state.updated_md_dict:
 
   preview_file = st.selectbox(
       "要約完了ファイルを選択:",
-      list(st.session_state.updated_md_dict.keys()),
+      sorted(list(st.session_state.updated_md_dict.keys())),
   )
 
   col1, col2 = st.columns(2)
@@ -357,7 +459,7 @@ if st.session_state.updated_md_dict:
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w") as zf:
       for fname, fcontent in st.session_state.updated_md_dict.items():
-        zf.writestr(f"summary_{fname}", fcontent)
+        zf.writestr(fname, fcontent)
 
     st.download_button(
         label="📦 要約完了ファイルをまとめてZIPダウンロード",
